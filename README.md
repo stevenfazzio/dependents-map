@@ -101,3 +101,8 @@ a title. Then run the stages with the new target's slug. Its data goes to
 Two things are still specific to umap-learn and would need generalising: the enrichment
 prompt in `06_enrich.py` (it describes UMAP and asks what UMAP is used for) and the PyPI
 lookup in stage 01, which assumes a Python package.
+
+## License
+
+The code is released under the [MIT License](LICENSE). The projects shown on the map
+belong to their authors.
