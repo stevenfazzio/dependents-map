@@ -19,9 +19,10 @@ The endpoint is a RunPod load-balancer endpoint, which scales to zero. To recrea
 then set ENDPOINT_ID below. A load balancer has no queue, so the first request after
 idle fails until a worker is up; `wait_until_ready` absorbs that.
 
-The endpoint that built the umap-learn map (o9hikcc2pzjwcn) was deleted on 2026-10-04,
-once the region names were final. Text already embedded is served from the disk cache;
-embedding anything new needs a new endpoint.
+Both endpoints that built the umap-learn map were deleted once its region names were
+final: the first (o9hikcc2pzjwcn) on 2026-10-04, and the one named below, made for the
+rebuild after stage 06 began filtering the corpus, on 2026-10-05. Text already embedded
+is served from the disk cache; embedding anything new needs a new endpoint.
 """
 
 import hashlib
@@ -38,7 +39,7 @@ import requests
 from config import DATA_DIR
 from tokenizers import Tokenizer
 
-ENDPOINT_ID = "o9hikcc2pzjwcn"
+ENDPOINT_ID = "6jxxlypeo4pzj0"
 BASE_URL = f"https://{ENDPOINT_ID}.api.runpod.ai"
 HEALTH_URL = f"https://api.runpod.ai/v2/{ENDPOINT_ID}/health"
 MODEL = "Qwen/Qwen3-Embedding-8B"

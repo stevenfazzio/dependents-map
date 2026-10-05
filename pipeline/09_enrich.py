@@ -3,11 +3,11 @@
 One call per document returns everything, with the categories constrained by a JSON
 schema so every value is one the map's legends know about.
 
-    uv run python pipeline/06_enrich.py umap-learn --pilot 60
+    uv run python pipeline/09_enrich.py umap-learn --pilot 60
         Synchronous calls at standard rates on a random sample, to read the outputs
         and category distributions before paying for the corpus.
 
-    uv run python pipeline/06_enrich.py umap-learn
+    uv run python pipeline/09_enrich.py umap-learn
         Everything not yet done, through the Batches API (half price, usually under
         an hour). The batch id is saved before polling, so a re-run resumes the
         batch instead of submitting it twice.
@@ -43,8 +43,6 @@ PRICE_INPUT, PRICE_OUTPUT = 1.00, 5.00
 
 # A result with one of these statuses is final; anything else is requested again.
 SETTLED = {"ok", "refused"}
-
-UMAP_MENTION = re.compile(r"u-?map|uniform manifold approximation", re.IGNORECASE)
 
 
 class ProjectType(StrEnum):
@@ -359,13 +357,14 @@ def run_batch(client: anthropic.Anthropic, target: Target, rows: pd.DataFrame) -
     report_cost(entries, batch=True)
 
 
-def build_table(documents: pd.DataFrame, results: dict[str, dict]) -> pd.DataFrame:
+def build_table(target: Target, documents: pd.DataFrame, results: dict[str, dict]) -> pd.DataFrame:
+    mention = re.compile(target.mention, re.IGNORECASE)
     rows = []
     for row in documents.itertuples():
         entry = results.get(row.doc_id, {"status": "missing"})
         # Judged on everything the model was shown, since a topic tag or the repository's
         # description can name UMAP when the README does not.
-        mentions = bool(UMAP_MENTION.search(user_message(row)))
+        mentions = bool(mention.search(user_message(row)))
         out = {"doc_id": row.doc_id, "status": entry["status"], "mentions_umap": mentions}
         if entry["status"] == "ok":
             out |= entry["fields"]
@@ -410,7 +409,7 @@ def main() -> None:
     if len(todo) or target.enrichment_batch_json.exists():
         run_batch(client, target, todo)
 
-    table = build_table(documents, current_results(target))
+    table = build_table(target, documents, current_results(target))
     print(f"Statuses: {table['status'].value_counts().to_dict()}")
     changed = (table["umap_role"] != table["umap_role_as_answered"]) & (table["status"] == "ok")
     print(f"umap_role corrected against the text for {changed.sum()} documents")

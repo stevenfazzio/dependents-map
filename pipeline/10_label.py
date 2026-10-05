@@ -1,19 +1,19 @@
 """Find the map's regions with Toponymy, at several zoom levels, and name them.
 
-Clustering runs on the 2-d layout from stage 05, the same coordinates that get
+Clustering runs on the 2-d layout from stage 08, the same coordinates that get
 plotted, so the regions are ones a viewer can see. Regions are named from the
-one-sentence summaries of stage 06, not from the raw READMEs.
+one-sentence summaries of stage 09, not from the raw READMEs.
 
-    uv run python pipeline/08_label.py umap-learn --explore
+    uv run python pipeline/10_label.py umap-learn --explore
         Free: fits only the clusterer at a few settings and prints, per layer, how
         many regions it finds and how many documents fall outside any region.
 
-    uv run python pipeline/08_label.py umap-learn --dry-run
+    uv run python pipeline/10_label.py umap-learn --dry-run
         Nearly free: runs the whole fit with placeholder names to collect every prompt
         the real run would send, counts their tokens, and names a few regions for real
         to measure output size. Prints a cost estimate.
 
-    uv run python pipeline/08_label.py umap-learn
+    uv run python pipeline/10_label.py umap-learn
         Paid: fits and names the regions.
 
 Writes labels.parquet with x, y and label_layer_0..k, where layer 0 is the FINEST layer
@@ -50,7 +50,7 @@ DRY_RUN_REAL_SAMPLE = 8
 
 
 def corpus_description(target: Target) -> str:
-    return f"collection of open-source projects that depend on the {target.package} library"
+    return f"collection of open-source projects that use the {target.package} library"
 
 
 def load_vectors(target: Target) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

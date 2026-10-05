@@ -1,4 +1,7 @@
-"""Choose the documents that go on the map: one per dependent project.
+"""Choose the candidates for the map: one document per dependent project.
+
+Stage 06 decides which of these go on the map, once stages 04 and 05 have looked at what
+each project does with the package.
 
 Reads what the earlier stages fetched and applies the selection rules in order,
 printing how many rows each rule removes:
@@ -278,8 +281,8 @@ def main() -> None:
         f"Selected {len(documents)} documents: {len(repositories)} repositories + "
         f"{len(pypi_only)} PyPI-only packages; {documents['is_package'].sum()} are packages"
     )
-    write_parquet_safely(documents, target.documents_parquet)
-    print(f"Wrote {target.documents_parquet.relative_to(ROOT)}")
+    write_parquet_safely(documents, target.candidates_parquet)
+    print(f"Wrote {target.candidates_parquet.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

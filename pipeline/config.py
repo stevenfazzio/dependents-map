@@ -16,13 +16,27 @@ REPO_URL = "https://github.com/stevenfazzio/dependents-map"
 
 
 @dataclass(frozen=True)
+class Carrier:
+    """A library that runs the package for its caller, who never has to name it."""
+
+    label: str  # what the map calls this path
+    module: str  # the library's import name
+    pattern: str  # code that takes the path
+
+
+@dataclass(frozen=True)
 class Target:
     """A project whose dependents we map."""
 
     slug: str  # directory name under data/ and docs/
     repo: str  # owner/name of the GitHub repo whose dependency graph lists the dependents
     package: str  # package name as shown in that page's package selector
+    module: str  # the name the package is imported under
+    name: str  # what the library is called in prose
+    mention: str  # a pattern that finds the library's name in a README
     title: str  # the map's title
+    # Libraries that run the package for a caller who never names it.
+    carriers: tuple[Carrier, ...] = ()
 
     @property
     def data_dir(self) -> Path:
@@ -58,6 +72,10 @@ class Target:
         return self.data_dir / "repos.parquet"
 
     @property
+    def candidates_parquet(self) -> Path:
+        return self.data_dir / "candidates.parquet"
+
+    @property
     def documents_parquet(self) -> Path:
         return self.data_dir / "documents.parquet"
 
@@ -89,6 +107,14 @@ class Target:
         return self.data_dir / "declarations.parquet"
 
     @property
+    def code_tree_log(self) -> Path:
+        return self.data_dir / "code_trees.batches.jsonl"
+
+    @property
+    def code_usage_parquet(self) -> Path:
+        return self.data_dir / "code_usage.parquet"
+
+    @property
     def labels_parquet(self) -> Path:
         return self.data_dir / "labels.parquet"
 
@@ -116,6 +142,20 @@ TARGETS = {
             slug="umap-learn",
             repo="lmcinnes/umap",
             package="umap-learn",
+            module="umap",
+            name="UMAP",
+            mention=r"u-?map|uniform manifold approximation",
+            # Each checked in the library's own source, October 2026.
+            carriers=(
+                # Builds a UMAP model unless it is handed another reducer.
+                Carrier("BERTopic", "bertopic", r"\bBERTopic\s*\("),
+                # Fits a UMAP model on its document vectors.
+                Carrier("Top2Vec", "top2vec", r"\bTop2Vec\s*\("),
+                # Its default method builds the graph with umap's fuzzy_simplicial_set.
+                Carrier("scanpy.pp.neighbors", "scanpy", r"\bpp\.neighbors\s*\("),
+                # A speaker model brings in a clustering backend that calls umap.UMAP.
+                Carrier("FunASR speaker model", "funasr", r"\bspk_model\b"),
+            ),
             title="UMAP Dependents Map",
         ),
     ]

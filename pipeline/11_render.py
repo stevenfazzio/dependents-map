@@ -5,22 +5,25 @@ the generated one-sentence summary and the categories. README text stays out of 
 page; it is in the embeddings, not the HTML.
 
 Usage:
-    uv run python pipeline/09_render.py umap-learn
+    uv run python pipeline/11_render.py umap-learn
     uv run python pipeline/build_index.py    # refresh the page that lists the maps
 """
 
 import argparse
 import colorsys
+import hashlib
 import html
 import json
 import os
 import re
 import tempfile
+from pathlib import Path
 
 import datamapplot
 import glasbey
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from config import PUBLIC_BASE_URL, ROOT, Target, get_target
 from matplotlib.colors import to_hex, to_rgb
 from storage import write_bytes_safely
@@ -29,6 +32,13 @@ FONT = "IBM Plex Sans"
 # Frame the central 99% of points on load. A small, far-flung island (on umap-learn, 36
 # submissions of one course assignment) otherwise shrinks everything else to fit it in.
 INITIAL_ZOOM_FRACTION = 0.99
+# The screen the page is laid out for, and the panels in its top-left corner as
+# (right edge, bottom edge) in pixels: the title panel, and the search box below it.
+DESIGN_SCREEN = (1280, 800)
+CORNER_PANELS = [(612, 143), (195, 215)]
+# The share of the screen's tighter dimension that the framed layout fills on load,
+# measured on this page.
+FRAME_SHARE = 0.69
 # DataMapPlot's default of 3 hid four of the six top-level labels on load at 1280 px.
 TEXT_COLLISION_SIZE_SCALE = 2
 # The page's data goes in files beside it rather than inside it: a multi-megabyte page is
@@ -65,6 +75,7 @@ NEUTRAL_COLORS = {
     "Not found": "#d9d9d9",
     "Repository": "#d0d0d0",
     "Listed only": "#9a9a9a",
+    "No code read": "#9a9a9a",
     "Other": "#8c8c8c",
     "Unknown": "#e2e2e2",
 }
@@ -100,6 +111,8 @@ HOVER_TEMPLATE = f"""
     <div><span style="{DOT.format(color="{type_dot}")}"></span>{{project_type}}</div>
     <div style="{FIELD_NAME}">UMAP use</div>
     <div><span style="{DOT.format(color="{role_dot}")}"></span>{{umap_role}}</div>
+    <div style="{FIELD_NAME}">In code</div>
+    <div><span style="{DOT.format(color="{code_dot}")}"></span>{{in_code}}</div>
     <div style="{FIELD_NAME}">Listed in</div>
     <div><span style="{DOT.format(color="{listed_dot}")}"></span>{{listed_in}}</div>
   </div>
@@ -193,7 +206,7 @@ def shown_label(values: pd.Series, others: pd.Series) -> pd.Series:
 
 
 def declaration_category(df: pd.DataFrame) -> pd.Series:
-    """Where each project names the target package, from stage 07's reading of its files."""
+    """Where each project names the target package, from stage 04's reading of its files."""
     declared = df["declaration_status"] == "declared"
     dumped = df["dumped"].fillna(False).astype(bool)
     category = np.select(
@@ -226,6 +239,38 @@ def declaration_detail(row, category: str) -> str:
     return category
 
 
+def code_category(df: pd.DataFrame, name: str) -> pd.Series:
+    """What each project's code does with the library, from stage 05's reading of it."""
+    # Importing without calling and naming without importing are one category here: both
+    # are code the library appears in and never runs from. The hovercard says which.
+    categories = {
+        "Calls it": f"Calls {name}",
+        "Another library's": f"Another library's {name}",
+        "Imports it, calls nothing": f"Mentions {name} only",
+        "Names it only": f"Mentions {name} only",
+        "No mention": "Not mentioned",
+        "No code read": "No code read",
+    }
+    category = df["code_use"].astype(str).map(categories)
+    assert category.notna().all(), "a code use the map has no category for"
+    return category
+
+
+def code_detail(row, category: str) -> str:
+    """The category with what a card has room to add."""
+    if row.code_use == "Another library's":
+        # The function that computes a layout, before the one that plots it; or, for a
+        # project that never names the library, the one that runs it for the project.
+        names = [*row.elsewhere] or [*row.through]
+        shown = min(names, key=lambda name: (".pl." in name, name))
+        return f"{category} ({shown})"
+    if row.code_use == "Imports it, calls nothing":
+        return f"{category} (imported, never called)"
+    if row.code_use == "Names it only":
+        return f"{category} (in names, strings or comments)"
+    return category
+
+
 def footer(row) -> str:
     parts = []
     if pd.notna(row.stars):
@@ -250,12 +295,13 @@ def title_pills(crawled: pd.Timestamp) -> str:
 
 
 def open_graph_tags(target: Target, n_documents: int) -> str:
+    # "Use or declare": what stage 06 keeps a project for.
     url = f"{PUBLIC_BASE_URL}{target.slug}/"
     og = {
         "og:title": target.title,
         "og:description": (
-            f"{n_documents:,} open-source projects that GitHub lists as depending on "
-            f"{target.package}, laid out by what their READMEs say and named at four zoom levels. "
+            f"{n_documents:,} open-source projects that use or declare {target.package}, "
+            "laid out by what their READMEs say and named at four zoom levels. "
             "Pan, zoom, hover and search."
         ),
         "og:type": "website",
@@ -273,10 +319,61 @@ def open_graph_tags(target: Target, n_documents: int) -> str:
     return "\n".join(tags)
 
 
+def version_data_urls(text: str, data_files: list[Path]) -> str:
+    """Give each data file's URL a query string that names its contents.
+
+    The page fetches its data separately. A browser that has both cached revalidates the
+    page on reload but can go on using its copy of the data, so a rebuilt page runs on the
+    previous build's data: a new colormap is in the menu and selecting it does nothing. A
+    URL that changes with the contents cannot be answered from an older copy.
+    """
+    for path in data_files:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        # The page writes each URL as a template string ending in the file's name.
+        text, n = re.subn(rf"/{re.escape(path.name)}(?=`)", f"/{path.name}?v={digest}", text)
+        assert n == 1, f"the page refers to {path.name} {n} times, not once"
+    return text
+
+
+def orient(coords: np.ndarray) -> np.ndarray:
+    """Mirror the layout so that as little of it as possible lies under the title panel.
+
+    Which way round a layout comes out is arbitrary, and a mirror image keeps every
+    distance, so the regions are the same ones. Left as it falls, a dense corner can land
+    under the panel, which then hides the region names there.
+    """
+    width, height = DESIGN_SCREEN
+    low, high = np.percentile(coords, [0.5, 99.5], axis=0)
+    scale = FRAME_SHARE * min(width / (high[0] - low[0]), height / (high[1] - low[1]))
+    centred = (coords - (low + high) / 2) * scale
+    best = None
+    for flip_y in (False, True):
+        for flip_x in (False, True):
+            # Where each point is drawn: x from the left edge, y from the top.
+            x = width / 2 + centred[:, 0] * (-1 if flip_x else 1)
+            y = height / 2 - centred[:, 1] * (-1 if flip_y else 1)
+            covered = sum(
+                int(((x < right) & (y < bottom)).sum()) for right, bottom in CORNER_PANELS
+            )
+            # Ties go to the fewest mirrorings, so a layout that already fits is left alone.
+            if best is None or covered < best[0]:
+                best = (covered, flip_x, flip_y)
+    covered, flip_x, flip_y = best
+    if flip_x or flip_y:
+        axes = " and ".join(name for name, flip in (("x", flip_x), ("y", flip_y)) if flip)
+        print(f"Mirrored the layout in {axes}; {covered} points are left under the title panel")
+    return coords * np.array([-1.0 if flip_x else 1.0, -1.0 if flip_y else 1.0])
+
+
 def load(target: Target) -> pd.DataFrame:
     documents = pd.read_parquet(target.documents_parquet).drop(columns=["text"])
     enrichment = pd.read_parquet(target.enrichment_parquet).drop(columns=["status"])
     labels = pd.read_parquet(target.labels_parquet)
+    # Labels carry the layout, so labels left from an earlier corpus would draw this one in
+    # the wrong places without any error.
+    assert set(labels["doc_id"]) == set(documents["doc_id"]), (
+        "labels.parquet is for a different set of documents; run stage 10 again"
+    )
     df = documents.merge(labels, on="doc_id", how="left", validate="one_to_one")
     df = df.merge(enrichment, on="doc_id", how="left", validate="one_to_one")
     declarations = pd.read_parquet(
@@ -284,8 +381,13 @@ def load(target: Target) -> pd.DataFrame:
         columns=["doc_id", "status", "basis", "dumped", "declared_in", "via", "scope"],
     ).rename(columns={"status": "declaration_status", "basis": "declaration_basis"})
     df = df.merge(declarations, on="doc_id", how="left", validate="one_to_one")
+    code = pd.read_parquet(
+        target.code_usage_parquet, columns=["doc_id", "use", "called", "elsewhere", "through"]
+    ).rename(columns={"use": "code_use"})
+    df = df.merge(code, on="doc_id", how="left", validate="one_to_one")
     assert len(df) == len(documents), "merge changed the row count"
-    assert df["declaration_status"].notna().all(), "documents stage 07 has not read"
+    assert df["declaration_status"].notna().all(), "documents stage 04 has not read"
+    assert df["code_use"].notna().all(), "documents stage 05 has not read"
     assert df["x"].notna().all(), "documents without coordinates"
     print(f"{len(df)} documents; {df['summary'].isna().sum()} without a summary")
     return df
@@ -297,6 +399,8 @@ def main() -> None:
     args = parser.parse_args()
     target = get_target(args.target)
     df = load(target)
+    df[["x", "y"]] = orient(df[["x", "y"]].to_numpy())
+    n_listed = pq.read_metadata(target.candidates_parquet).num_rows
 
     domain_label = shown_label(df["domain"], df["domain_other"])
     type_label = shown_label(df["project_type"], df["project_type_other"])
@@ -315,6 +419,9 @@ def main() -> None:
     )
     role_values, role_meta, role_colors = categorical_colormap(
         "umap_role", "UMAP use (per README)", df["umap_role"]
+    )
+    code_values, code_meta, code_colors = categorical_colormap(
+        "in_code", f"{target.name} in the code", code_category(df, target.name)
     )
     listed_values, listed_meta, listed_colors = categorical_colormap(
         "listed_in",
@@ -342,6 +449,11 @@ def main() -> None:
             "type_dot": [type_colors[v] for v in type_values],
             "umap_role": pd.Series(role_values).map(html.escape),
             "role_dot": [role_colors[v] for v in role_values],
+            "in_code": [
+                html.escape(code_detail(row, category))
+                for row, category in zip(df.itertuples(), code_values, strict=True)
+            ],
+            "code_dot": [code_colors[v] for v in code_values],
             "listed_in": [
                 html.escape(declaration_detail(row, category))
                 for row, category in zip(df.itertuples(), listed_values, strict=True)
@@ -363,6 +475,9 @@ def main() -> None:
                         # What a lock file says pulled the package in, so searching for
                         # that library finds the projects it carries.
                         " ".join(row.via) if row.declaration_status == "lock only" else "",
+                        # What the code calls, by its dotted name, so that searching for a
+                        # class or function finds the projects that use it.
+                        " ".join([*row.called, *row.elsewhere, *row.through]),
                     ]
                 )
                 for row, text, domain, kind in zip(
@@ -410,6 +525,7 @@ def main() -> None:
             domain_values,
             type_values,
             role_values,
+            code_values,
             listed_values,
             kind_values,
             # DataMapPlot spaces five legend ticks evenly over the range, so capping at
@@ -422,6 +538,7 @@ def main() -> None:
             domain_meta,
             type_meta,
             role_meta,
+            code_meta,
             listed_meta,
             kind_meta,
             {
@@ -443,9 +560,11 @@ def main() -> None:
         cvd_safer=True,
         title=target.title,
         sub_title=(
-            # "GitHub lists": its dependency graph counts lock files and dumped
-            # environments, so some of these projects never asked for the package.
-            f"{len(df):,} projects GitHub lists as depending on {target.package}."
+            # GitHub's dependency graph also counts lock files and dumped environments.
+            # Stage 06 left out the projects listed only for those, and the count of
+            # all it lists says so.
+            f"{len(df):,} projects that use or declare {target.package}, "
+            f"of the {n_listed:,} GitHub lists."
             # DataMapPlot inserts the subtitle as HTML, so the break is explicit: two
             # short lines keep the panel narrower than one long wrapped one.
             "<br />"
@@ -489,6 +608,9 @@ def main() -> None:
             flags=re.DOTALL,
         )
         assert n == 1, "title panel not found for the pills"
+        data_files = sorted(output.parent.glob(f"{DATA_PREFIX}_*"))
+        assert data_files, "no data files were written beside the page"
+        text = version_data_urls(text, data_files)
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
         os.chmod(tmp, 0o644)
@@ -502,12 +624,11 @@ def main() -> None:
         "title": target.title,
         "package": target.package,
         "documents": len(df),
+        "listed": n_listed,
         "crawled": f"{crawled.max():%Y-%m}",
     }
     write_bytes_safely(target.map_meta_json, (json.dumps(meta, indent=2) + "\n").encode())
 
-    data_files = sorted(output.parent.glob(f"{DATA_PREFIX}_*"))
-    assert data_files, "no data files were written beside the page"
     print(f"Wrote {output.relative_to(ROOT)} ({output.stat().st_size / 1e3:.0f} KB) and:")
     for path in data_files:
         print(f"  {path.name} ({path.stat().st_size / 1e3:.0f} KB)")

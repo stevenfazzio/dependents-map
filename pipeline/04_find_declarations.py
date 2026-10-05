@@ -10,7 +10,7 @@ repository's dependency files and sorts it into:
   lock only   only lock files name it; what the lock file says required it is kept as `via`
   not found   no dependency file names it
 
-Three passes, each logged and resumable like stage 02's:
+Three passes, each logged and resumable:
   1. The dependency files in the repository root, whose names stage 02 already listed.
   2. For repositories the root did not settle, the full file listing (one REST call each).
   3. For those, the dependency files outside the root, plus a raw copy of any file
@@ -20,26 +20,20 @@ Three passes, each logged and resumable like stage 02's:
 Packages known only from PyPI are sorted by the requirement in their PyPI metadata.
 
 Usage:
-    uv run python pipeline/07_find_declarations.py umap-learn --limit 200
-    uv run python pipeline/07_find_declarations.py umap-learn
+    uv run python pipeline/04_find_declarations.py umap-learn --limit 200
+    uv run python pipeline/04_find_declarations.py umap-learn
 """
 
 import argparse
 import json
 import re
-import time
 import tomllib
 from collections import Counter
-from importlib import import_module
 
+import github
 import pandas as pd
-import requests
 from config import ROOT, Target, get_target
 from storage import write_parquet_safely
-
-# Stage 02's GitHub client: retries, rate-limit waits, batch splitting and the pass log.
-# Its file name starts with a digit, so a plain import statement cannot name it.
-github = import_module("02_fetch_repos")
 
 ROOT_BATCH_SIZE = 40
 REMAINING_BATCH_SIZE = 10
@@ -61,12 +55,6 @@ DEPENDENCY_FILE = re.compile(
       | [^/]*(environment|conda)[^/]*\.ya?ml | env[^/]*\.ya?ml | meta\.ya?ml
     )$""",
     re.IGNORECASE | re.VERBOSE,
-)
-# Committed environments and other people's code: not this project's dependency files.
-VENDORED = re.compile(
-    r"(^|/)(site-packages|dist-packages|node_modules|\.?venv[^/]*|\.?env|__pycache__|"
-    r"\.ipynb_checkpoints|lib/python[\d.]+|third_party|vendor)(/|$)",
-    re.IGNORECASE,
 )
 TOML_LOCKS = {"uv.lock", "poetry.lock", "pdm.lock"}
 TOML_MANIFESTS = {"pyproject.toml", "pipfile", "pixi.toml"}
@@ -371,31 +359,9 @@ def fetch_root_files(
     return results
 
 
-def rest_get(token: str, path: str, accept: str) -> requests.Response | None:
-    """GET from the REST API, waiting out rate limits. None when the retries run out."""
-    for attempt in range(github.MAX_RETRIES):
-        resp = None
-        try:
-            resp = github._session(token).get(
-                f"{github.REST_URL}{path}", headers={"Accept": accept}, timeout=120
-            )
-        except (
-            requests.Timeout,
-            requests.ConnectionError,
-            requests.exceptions.ChunkedEncodingError,
-        ):
-            pass
-        else:
-            if resp.status_code not in github.RETRY_STATUS:
-                return resp
-        if attempt < github.MAX_RETRIES - 1:
-            time.sleep(github._backoff(attempt, resp))
-    return None
-
-
 def fetch_tree(token: str, target: Target, name: str) -> dict:
     """List a repository's files, keeping the dependency files outside the root."""
-    resp = rest_get(
+    resp = github.rest_get(
         token, f"/repos/{name}/git/trees/HEAD?recursive=1", "application/vnd.github+json"
     )
     if resp is None:
@@ -411,7 +377,9 @@ def fetch_tree(token: str, target: Target, name: str) -> dict:
     nested = [
         e
         for e in blobs
-        if "/" in e["path"] and DEPENDENCY_FILE.search(e["path"]) and not VENDORED.search(e["path"])
+        if "/" in e["path"]
+        and DEPENDENCY_FILE.search(e["path"])
+        and not github.VENDORED.search(e["path"])
     ]
     nested.sort(key=lambda e: (e["path"].count("/"), e["path"]))
     installed = normalize(target.package).replace("-", "_")
@@ -424,13 +392,6 @@ def fetch_tree(token: str, target: Target, name: str) -> dict:
         "vendored_copy": any(vendored_copy.search(e["path"]) for e in blobs),
         "files": [[e["path"], e.get("size", 0), e["sha"]] for e in nested[:MAX_NESTED_FILES]],
     }
-
-
-def decode(raw: bytes) -> str:
-    # PowerShell's `pip freeze > requirements.txt` writes UTF-16, which GitHub calls binary.
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return raw.decode("utf-16", errors="replace")
-    return raw.decode("utf-8-sig", errors="replace")
 
 
 def fetch_remaining(
@@ -461,13 +422,15 @@ def fetch_remaining(
         for f in partial:
             if has_direct(list(files.values())):
                 break
-            resp = rest_get(
+            resp = github.rest_get(
                 token, f"/repos/{name}/git/blobs/{f['oid']}", "application/vnd.github.raw+json"
             )
             if resp is None or resp.status_code != 200:
                 result = {"status": "error", "error": f"raw copy of {f['path']} failed"}
                 break
-            reread = file_record(target, f["path"], f["size"], f["oid"], decode(resp.content), True)
+            reread = file_record(
+                target, f["path"], f["size"], f["oid"], github.text_of(resp.content), True
+            )
             files[f["path"]] = reread
             result["reread"].append(reread)
         results[name] = result
@@ -591,9 +554,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="only a random N repositories (for testing)")
     args = parser.parse_args()
     target: Target = get_target(args.target)
-    token = github.github_token()
+    token = github.token()
 
-    documents = pd.read_parquet(target.documents_parquet)
+    documents = pd.read_parquet(target.candidates_parquet)
     repos = documents[documents["source"] == "github"]
     if args.limit:
         repos = repos.sample(min(args.limit, len(repos)), random_state=0)

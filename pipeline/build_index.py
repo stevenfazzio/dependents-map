@@ -90,8 +90,8 @@ ENTRY = """  <article>
 def entry(slug: str, meta: dict) -> str:
     crawled = datetime.strptime(meta["crawled"], "%Y-%m")
     description = (
-        f"{meta['documents']:,} projects that depend on {meta['package']}, as GitHub's "
-        f"dependency graph listed them in {crawled:%B %Y}."
+        f"{meta['documents']:,} projects that use or declare {meta['package']}, of the "
+        f"{meta['listed']:,} that GitHub's dependency graph listed in {crawled:%B %Y}."
     )
     return ENTRY.format(
         slug=slug, title=html.escape(meta["title"]), description=html.escape(description)
@@ -122,7 +122,7 @@ def main() -> None:
         if target.map_meta_json.exists()
     }
     if not published:
-        raise SystemExit("No rendered maps found under docs/. Run pipeline/09_render.py first.")
+        raise SystemExit("No rendered maps found under docs/. Run pipeline/11_render.py first.")
 
     page = PAGE.format(
         title=TITLE,

@@ -5,8 +5,8 @@ come through embedder.py's disk cache, so a re-run only embeds text it has not s
 and an interrupted run resumes where it stopped.
 
 Usage:
-    uv run python pipeline/04_embed.py umap-learn
-    uv run python pipeline/04_embed.py umap-learn --limit 200    # timing pilot
+    uv run python pipeline/07_embed.py umap-learn
+    uv run python pipeline/07_embed.py umap-learn --limit 200    # timing pilot
 """
 
 import argparse

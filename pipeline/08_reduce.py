@@ -6,7 +6,7 @@ it makes min_dist a clustering parameter: it stays low so regions come out dense
 for density clustering to find.
 
 Usage:
-    uv run python pipeline/05_reduce.py umap-learn
+    uv run python pipeline/08_reduce.py umap-learn
 """
 
 import argparse

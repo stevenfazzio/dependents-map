@@ -24,31 +24,14 @@ Usage:
 import argparse
 import base64
 import json
-import os
-import subprocess
-import threading
-import time
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
-from pathlib import Path
 
+import github
 import pandas as pd
-import requests
 from config import ROOT, Target, get_target
-from storage import append_jsonl, read_jsonl_log, write_parquet_safely
+from storage import write_parquet_safely
 
-GRAPHQL_URL = "https://api.github.com/graphql"
-REST_URL = "https://api.github.com"
 METADATA_BATCH_SIZE = 25
 README_BATCH_SIZE = 50
-CONCURRENT_REQUESTS = 5
-MAX_RETRIES = 5
-RETRY_STATUS = {403, 429, 500, 502, 503, 504}  # GitHub signals secondary rate limits with 403
-LOG_EVERY_BATCHES = 40
-
-# A result with one of these statuses is final; anything else is fetched again on a re-run.
-SETTLED = {"ok", "not_found", "missing"}
 
 METADATA_FRAGMENT = """
 fragment Metadata on Repository {
@@ -87,82 +70,6 @@ README_EXTENSIONS = (".md", ".markdown", ".rst", ".txt", "")
 # Directories other than the root where GitHub recognises a README.
 README_DIRS = {".github", "docs"}
 
-_thread = threading.local()
-
-
-class BatchFailed(RuntimeError):
-    """A query kept failing for reasons that are not about any one repository."""
-
-
-def github_token() -> str:
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if token:
-        return token
-    try:
-        result = subprocess.run(
-            ["gh", "auth", "token"], capture_output=True, text=True, check=True, timeout=30
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        raise SystemExit("Set GITHUB_TOKEN, or log in with `gh auth login`.") from None
-    return result.stdout.strip()
-
-
-def _session(token: str) -> requests.Session:
-    if not hasattr(_thread, "session"):
-        _thread.session = requests.Session()
-        _thread.session.headers["Authorization"] = f"Bearer {token}"
-    return _thread.session
-
-
-def _backoff(attempt: int, resp: requests.Response | None) -> int:
-    """Seconds to wait before a retry, honouring GitHub's own hint when it sends one."""
-    wait = min(2**attempt * 5, 120)
-    if resp is not None:
-        retry_after = resp.headers.get("Retry-After", "")
-        if retry_after.isdigit():
-            wait = max(wait, int(retry_after) + 1)
-        elif resp.headers.get("X-RateLimit-Remaining") == "0":
-            reset_at = int(resp.headers.get("X-RateLimit-Reset", 0))
-            wait = max(wait, reset_at - int(time.time()) + 5)
-    return wait
-
-
-def graphql(token: str, query: str) -> tuple[dict, list[dict]]:
-    """Run a query and return (data, errors that name a single alias).
-
-    Errors with a path belong to one repository and are returned for the caller to
-    record. Anything else (throttling, timeouts, server faults) is retried here.
-    """
-    reason = "unknown"
-    for attempt in range(MAX_RETRIES):
-        resp = None
-        try:
-            resp = _session(token).post(GRAPHQL_URL, json={"query": query}, timeout=60)
-        except (
-            requests.Timeout,
-            requests.ConnectionError,
-            requests.exceptions.ChunkedEncodingError,
-        ) as e:
-            reason = type(e).__name__
-        else:
-            if resp.status_code == 200:
-                body = resp.json()
-                errors = body.get("errors", [])
-                query_errors = [e for e in errors if not e.get("path")]
-                if body.get("data") is not None and not query_errors:
-                    return body["data"], errors
-                first = (query_errors or errors or [{}])[0]
-                reason = first.get("type") or first.get("message") or "no data"
-            elif resp.status_code in RETRY_STATUS:
-                reason = f"HTTP {resp.status_code}"
-            else:
-                resp.raise_for_status()
-        if attempt < MAX_RETRIES - 1:
-            wait = _backoff(attempt, resp)
-            print(f"  {reason}, retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
-            time.sleep(wait)
-    raise BatchFailed(reason)
-
 
 def _repository_alias(i: int, full_name: str, selection: str) -> str:
     owner, name = full_name.split("/", 1)
@@ -177,7 +84,7 @@ def _alias_errors(errors: list[dict]) -> dict[str, str]:
 def fetch_metadata(token: str, names: list[str]) -> dict[str, dict]:
     aliases = [_repository_alias(i, name, "{ ...Metadata }") for i, name in enumerate(names)]
     query = "query {\n" + "\n".join(aliases) + "\n}\n" + METADATA_FRAGMENT
-    data, errors = graphql(token, query)
+    data, errors = github.graphql(token, query)
     alias_errors = _alias_errors(errors)
 
     results = {}
@@ -201,7 +108,9 @@ def fetch_readmes(token: str, readme_names: dict[str, str]) -> dict[str, dict]:
         expression = json.dumps(f"HEAD:{readme_names[name]}", ensure_ascii=False)
         blob = f"{{ readme: object(expression: {expression}) {{ ...ReadmeBlob }} }}"
         aliases.append(_repository_alias(i, name, blob))
-    data, errors = graphql(token, "query {\n" + "\n".join(aliases) + "\n}\n" + README_FRAGMENT)
+    data, errors = github.graphql(
+        token, "query {\n" + "\n".join(aliases) + "\n}\n" + README_FRAGMENT
+    )
     alias_errors = _alias_errors(errors)
 
     results = {}
@@ -220,90 +129,16 @@ def fetch_readmes(token: str, readme_names: dict[str, str]) -> dict[str, dict]:
 
 def fetch_readme_outside_root(token: str, name: str) -> dict:
     """Ask the REST API for the README GitHub recognises, wherever in the repository it is."""
-    reason = "unknown"
-    for attempt in range(MAX_RETRIES):
-        resp = None
-        try:
-            resp = _session(token).get(
-                f"{REST_URL}/repos/{name}/readme",
-                headers={"Accept": "application/vnd.github+json"},
-                timeout=60,
-            )
-        except (requests.Timeout, requests.ConnectionError) as e:
-            reason = type(e).__name__
-        else:
-            if resp.status_code == 200:
-                body = resp.json()
-                text = base64.b64decode(body["content"]).decode("utf-8", errors="replace")
-                return {
-                    "status": "ok",
-                    "readme_name": body["path"],
-                    "text": text,
-                    "byteSize": body["size"],
-                }
-            if resp.status_code == 404:
-                return {"status": "missing"}
-            if resp.status_code not in RETRY_STATUS:
-                return {"status": "error", "error": f"HTTP {resp.status_code}"}
-            reason = f"HTTP {resp.status_code}"
-        if attempt < MAX_RETRIES - 1:
-            time.sleep(_backoff(attempt, resp))
-    return {"status": "error", "error": reason}
-
-
-def fetch_with_split(fetch: Callable[[list[str]], dict[str, dict]], names: list[str]) -> dict:
-    """Run one batch, halving it on failure so one bad repository can't sink the rest."""
-    try:
-        return fetch(names)
-    except BatchFailed as e:
-        if len(names) == 1:
-            return {names[0]: {"status": "error", "error": f"batch failed: {e}"}}
-        half = len(names) // 2
-        print(f"  Batch of {len(names)} failed ({e}); splitting")
-        return {
-            **fetch_with_split(fetch, names[:half]),
-            **fetch_with_split(fetch, names[half:]),
-        }
-
-
-def latest_results(log_path: Path) -> dict[str, dict]:
-    """Collapse a log to each repository's most recent result."""
-    results = {}
-    for record in read_jsonl_log(log_path):
-        results.update(record["results"])
-    return results
-
-
-def run_pass(
-    label: str,
-    log_path: Path,
-    names: list[str],
-    batch_size: int,
-    fetch: Callable[[list[str]], dict[str, dict]],
-) -> dict[str, dict]:
-    """Fetch every name without a settled result, logging each batch as it completes."""
-    results = latest_results(log_path)
-    todo = [n for n in names if results.get(n, {}).get("status") not in SETTLED]
-    print(f"{label}: {len(names) - len(todo)} already settled, {len(todo)} to fetch")
-    if not todo:
-        return results
-
-    batches = [todo[i : i + batch_size] for i in range(0, len(todo), batch_size)]
-    done = 0
-    with (
-        open(log_path, "a") as log,
-        ThreadPoolExecutor(max_workers=CONCURRENT_REQUESTS) as pool,
-    ):
-        futures = [pool.submit(fetch_with_split, fetch, batch) for batch in batches]
-        for n, future in enumerate(as_completed(futures), start=1):
-            batch_results = future.result()
-            fetched_at = datetime.now(UTC).isoformat(timespec="seconds")
-            append_jsonl(log, {"fetched_at": fetched_at, "results": batch_results})
-            results.update(batch_results)
-            done += len(batch_results)
-            if n % LOG_EVERY_BATCHES == 0 or n == len(batches):
-                print(f"{label}: {done}/{len(todo)}")
-    return results
+    resp = github.rest_get(token, f"/repos/{name}/readme", "application/vnd.github+json")
+    if resp is None:
+        return {"status": "error", "error": "retries exhausted"}
+    if resp.status_code == 404:
+        return {"status": "missing"}
+    if resp.status_code != 200:
+        return {"status": "error", "error": f"HTTP {resp.status_code}"}
+    body = resp.json()
+    text = base64.b64decode(body["content"]).decode("utf-8", errors="replace")
+    return {"status": "ok", "readme_name": body["path"], "text": text, "byteSize": body["size"]}
 
 
 def pick_readme(entries: list[dict]) -> str | None:
@@ -419,14 +254,14 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="only the first N repositories (for testing)")
     args = parser.parse_args()
     target: Target = get_target(args.target)
-    token = github_token()
+    token = github.token()
 
     names = load_repository_names(target)
     if args.limit:
         names = names[: args.limit]
         print(f"--limit: keeping the first {len(names)}")
 
-    metadata = run_pass(
+    metadata = github.run_pass(
         "metadata",
         target.repo_metadata_log,
         names,
@@ -441,7 +276,7 @@ def main() -> None:
             entries = (meta["repo"].get("root") or {}).get("entries") or []
             if readme_name := pick_readme(entries):
                 readme_names[name] = readme_name
-    run_pass(
+    github.run_pass(
         "readmes",
         target.repo_readme_log,
         list(readme_names),
@@ -457,7 +292,7 @@ def main() -> None:
             if any(e["type"] == "tree" and e["name"] in README_DIRS for e in entries):
                 elsewhere.append(name)
     # Same log as pass 2: the two passes cover disjoint repositories.
-    readmes = run_pass(
+    readmes = github.run_pass(
         "readmes outside the root",
         target.repo_readme_log,
         elsewhere,
