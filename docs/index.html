@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dependents Maps</title>
+<meta property="og:title" content="Dependents Maps">
+<meta property="og:description" content="Each map lays out the open-source projects that depend on one package, placed by what their READMEs say. Projects that sit close together do similar things.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://stevenfazzio.com/dependents-map/">
+<meta property="og:image" content="https://stevenfazzio.com/dependents-map/umap-learn/social-preview.png">
+<meta name="description" content="Each map lays out the open-source projects that depend on one package, placed by what their READMEs say. Projects that sit close together do similar things.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root { --ink: #1f2328; --muted: #6b7280; --rule: #e5e7eb; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 56px 24px 72px;
+    font-family: "IBM Plex Sans", system-ui, sans-serif; font-size: 17px; line-height: 1.5;
+    color: var(--ink); background: #fff;
+  }
+  main { max-width: 960px; margin: 0 auto; }
+  h1 { margin: 0 0 12px; font-size: 34px; font-weight: 600; line-height: 1.15;
+       letter-spacing: -0.015em; }
+  .intro { max-width: 62ch; margin: 0 0 44px; color: var(--muted); }
+  article { margin: 0 0 56px; }
+  article a.preview { display: block; border: 1px solid var(--rule); border-radius: 10px;
+                      overflow: hidden; }
+  article img { display: block; width: 100%; height: auto; aspect-ratio: 1200 / 630; }
+  h2 { margin: 18px 0 4px; font-size: 22px; font-weight: 600; line-height: 1.25; }
+  h2 a { color: inherit; text-decoration: none; }
+  h2 a:hover { text-decoration: underline; text-underline-offset: 3px; }
+  article p { max-width: 62ch; margin: 0; color: var(--muted); }
+  footer { max-width: 62ch; padding-top: 20px; border-top: 1px solid var(--rule);
+           font-size: 15px; color: var(--muted); }
+  footer a { color: var(--ink); text-underline-offset: 3px; }
+  a:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; border-radius: 4px; }
+  @media (max-width: 600px) {
+    body { padding: 32px 16px 48px; font-size: 16px; }
+    h1 { font-size: 28px; }
+    h2 { font-size: 20px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Dependents Maps</h1>
+  <p class="intro">Each map lays out the open-source projects that depend on one package, placed by what their READMEs say. Projects that sit close together do similar things.</p>
+  <article>
+    <a class="preview" href="umap-learn/" aria-hidden="true" tabindex="-1">
+      <img src="umap-learn/social-preview.png" width="1200" height="630" alt="">
+    </a>
+    <h2><a href="umap-learn/">UMAP Dependents Map</a></h2>
+    <p>10,509 projects that depend on umap-learn, as GitHub&#x27;s dependency graph listed them in October 2026.</p>
+  </article>
+  <footer>
+    Built by <a href="https://stevenfazzio.com/">Steven Fazzio</a>.
+    The code and the method are <a href="https://github.com/stevenfazzio/dependents-map">on GitHub</a>.
+  </footer>
+</main>
+</body>
+</html>

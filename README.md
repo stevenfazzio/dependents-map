@@ -75,6 +75,7 @@ uv run python pipeline/07_label.py umap-learn --dry-run      # cost estimate
 uv run python pipeline/07_label.py umap-learn
 uv run python pipeline/08_render.py umap-learn
 uv run python pipeline/09_social_preview.py umap-learn
+uv run python pipeline/build_index.py                        # the page that lists the maps
 ```
 
 For umap-learn the paid steps came to about $21 for the summaries and categories, $2
@@ -87,7 +88,8 @@ to view locally:
 python3 -m http.server 8765 --bind 127.0.0.1 --directory docs
 ```
 
-Then open http://127.0.0.1:8765/umap-learn/.
+Then open http://127.0.0.1:8765/ for the list of maps, or
+http://127.0.0.1:8765/umap-learn/ for the map itself.
 
 Intermediate data lives in `data/` and is not committed.
 
@@ -96,7 +98,8 @@ Intermediate data lives in `data/` and is not committed.
 Add a `Target` to `TARGETS` in `pipeline/config.py` with the repository whose dependency
 graph lists the dependents, the package name as GitHub's package selector shows it, and
 a title. Then run the stages with the new target's slug. Its data goes to
-`data/<slug>/` and its map to `docs/<slug>/`.
+`data/<slug>/` and its map to `docs/<slug>/`, and `build_index.py` adds it to the list
+at `docs/index.html`.
 
 Two things are still specific to umap-learn and would need generalising: the enrichment
 prompt in `06_enrich.py` (it describes UMAP and asks what UMAP is used for) and the PyPI

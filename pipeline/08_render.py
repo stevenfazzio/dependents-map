@@ -6,11 +6,13 @@ page; it is in the embeddings, not the HTML.
 
 Usage:
     uv run python pipeline/08_render.py umap-learn
+    uv run python pipeline/build_index.py    # refresh the page that lists the maps
 """
 
 import argparse
 import colorsys
 import html
+import json
 import os
 import re
 import tempfile
@@ -21,6 +23,7 @@ import numpy as np
 import pandas as pd
 from config import PUBLIC_BASE_URL, ROOT, Target, get_target
 from matplotlib.colors import to_hex, to_rgb
+from storage import write_bytes_safely
 
 FONT = "IBM Plex Sans"
 # Frame the central 99% of points on load. A small, far-flung island (on umap-learn, 36
@@ -421,6 +424,15 @@ def main() -> None:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+    # A few facts about this build, for the index page that lists the maps.
+    meta = {
+        "title": target.title,
+        "package": target.package,
+        "documents": len(df),
+        "crawled": f"{crawled.max():%Y-%m}",
+    }
+    write_bytes_safely(target.map_meta_json, (json.dumps(meta, indent=2) + "\n").encode())
+
     data_files = sorted(output.parent.glob(f"{DATA_PREFIX}_*"))
     assert data_files, "no data files were written beside the page"
     print(f"Wrote {output.relative_to(ROOT)} ({output.stat().st_size / 1e3:.0f} KB) and:")

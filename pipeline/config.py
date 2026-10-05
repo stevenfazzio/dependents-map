@@ -12,6 +12,7 @@ DATA_DIR = ROOT / "data"
 DOCS_DIR = ROOT / "docs"  # served by GitHub Pages
 # Where docs/ is published; each target's map lives at <base><slug>/.
 PUBLIC_BASE_URL = "https://stevenfazzio.com/dependents-map/"
+REPO_URL = "https://github.com/stevenfazzio/dependents-map"
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,10 @@ class Target:
     @property
     def social_preview_png(self) -> Path:
         return DOCS_DIR / self.slug / "social-preview.png"
+
+    @property
+    def map_meta_json(self) -> Path:
+        return DOCS_DIR / self.slug / "meta.json"
 
 
 TARGETS = {
