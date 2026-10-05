@@ -7,8 +7,10 @@ four zoom levels.
 The first map is of [`umap-learn`](https://github.com/lmcinnes/umap): 10,509 projects
 that GitHub's dependency graph listed as depending on it in October 2026.
 
-**Map:** https://stevenfazzio.com/dependents-map/umap-learn/ (the address `docs/` is set
-up to be published at; see `PUBLIC_BASE_URL` in `pipeline/config.py`)
+**Live map:** https://stevenfazzio.com/dependents-map/umap-learn/
+
+All maps are listed at https://stevenfazzio.com/dependents-map/. GitHub Pages serves
+them from `docs/`.
 
 The published page carries only metadata (names, star counts, dates, topics) and
 model-written text (one-sentence summaries, categories, region names). No README text
