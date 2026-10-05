@@ -13,9 +13,11 @@ on it in October 2026.
 All maps are listed at https://stevenfazzio.com/dependents-map/. GitHub Pages serves
 them from `docs/`.
 
-The published page carries only metadata (names, star counts, dates, topics) and
-model-written text (one-sentence summaries, categories, region names). No README text
-is redistributed. Clicking a point opens the project.
+The published page carries metadata (names, star counts, dates, topics), model-written
+text (one-sentence summaries, categories, region names, and a sentence on how each
+project uses UMAP), and a few facts read from each project's code and dependency files:
+the call to UMAP it makes most often, the names of what it calls, and the version it asks
+for. No README text is redistributed. Clicking a point opens the project.
 
 ## How it's built
 
@@ -35,9 +37,10 @@ all kept on disk, so a re-run only does what is missing.
 | Embed | `07_embed.py` | Qwen3-Embedding-8B, served by vLLM on a RunPod serverless endpoint, embeds each README (cut to 8,000 tokens) |
 | Reduce | `08_reduce.py` | UMAP to the 2-d layout |
 | Enrich | `09_enrich.py` | Claude Haiku 4.5 (Message Batches API) writes a one-sentence summary and labels project type, domain, and what the README says UMAP is used for |
-| Label | `10_label.py` | [Toponymy](https://github.com/TutteInstitute/toponymy) finds regions on the layout and names them with Claude Opus 5.5, from the summaries |
-| Render | `11_render.py` | [DataMapPlot](https://github.com/TutteInstitute/datamapplot) builds `docs/<target>/index.html` and the data files beside it |
-| Card | `12_social_preview.py` | Screenshots the rendered map in Chrome for the link-preview image |
+| Describe use | `10_describe_usage.py` | Claude Sonnet 5.5 (Message Batches API) reads the code around each project's calls to the package and says what data goes in and what the output is used for, quoting a line of the code for each use it names |
+| Label | `11_label.py` | [Toponymy](https://github.com/TutteInstitute/toponymy) finds regions on the layout and names them with Claude Opus 5.5, from the summaries |
+| Render | `12_render.py` | [DataMapPlot](https://github.com/TutteInstitute/datamapplot) builds `docs/<target>/index.html` and the data files beside it |
+| Card | `13_social_preview.py` | Screenshots the rendered map in Chrome for the link-preview image |
 
 Regions are found on the same 2-d layout that is plotted, so every named region matches
 something visible on the map.
@@ -68,27 +71,38 @@ something visible on the map.
   precomputed metric, 97 use `umap.plot`, 91 fit with labels, and 33 each use DensMAP and
   Parametric UMAP. 1,105 set the metric to cosine and to nothing else, against 2,662
   that leave it at the default. 2,444 set `random_state` in every call and 1,955 in none.
+- About 27% of the projects on the map mention UMAP anywhere in their README, and fewer
+  say what it is for, so stage 10 has a model read the code around each call. Of the 5,031
+  calling projects, 73% plot UMAP's output, 26% cluster it, 10% offer UMAP to their own
+  users as an option, and 9% compare it with other methods. 30% reduce text, 15% tabular or
+  sensor data, 13% images, 12% omics or biological sequences and 6% audio, and for 51% the
+  data arrives as a neural network's embeddings. The code shows a purpose for 4,880
+  projects, where the READMEs state one for 1,379.
 - The map has 178, 53, 17 and 6 named regions, from the finest layer to the coarsest.
-- About 27% of the projects on the map mention UMAP anywhere in their README. Point size
-  and one colormap show GitHub stars; the other colormaps show domain, project type, UMAP
-  use per the README, UMAP in the code, the UMAP features used, the distance metric,
-  whether a random seed is set, where `umap-learn` is listed, which versions of it are
-  asked for, package or repository, and the year of the last push.
-- A project can call UMAP many times, and a point has one colour. Each project is coloured
-  by the rarest feature it uses, and by the metric it sets where it sets exactly one. The
-  hovercard shows the call a project makes most often, and search finds every project that
-  uses a feature or sets a value, for example `metric=cosine` or `umap-learn==0.5.3`.
+- Point size and one colormap show GitHub stars; the other colormaps show domain, project
+  type, what UMAP is used for, the data it reduces, UMAP in the code, the UMAP features
+  used, the distance metric, whether a random seed is set, where `umap-learn` is listed,
+  which versions of it are asked for, package or repository, and the year of the last
+  push.
+- A project can call UMAP many times and for several purposes, and a point has one colour.
+  Each project is coloured by the rarest feature it uses, by the metric it sets where it
+  sets exactly one, and by its rarest purpose, except that plotting and clustering
+  together, the commonest pair, have a category of their own. The hovercard shows the call
+  a project makes most often, every purpose, and a sentence on what goes in and what
+  becomes of the result. Search finds every project that uses a feature, sets a value or
+  mentions a method in that sentence, for example `metric=cosine`, `umap-learn==0.5.3` or
+  `HDBSCAN`.
 
 ## Reproducing
 
 Requires [uv](https://docs.astral.sh/uv/) and:
 
 - a GitHub login for `gh` (or `GITHUB_TOKEN`), for stages 02, 04 and 05;
-- `RUNPOD_API_KEY` and an endpoint serving Qwen3-Embedding-8B, for stages 07 and 10. The
+- `RUNPOD_API_KEY` and an endpoint serving Qwen3-Embedding-8B, for stages 07 and 11. The
   endpoint's configuration is at the top of `pipeline/embedder.py`, and its ID is set
   there. The one that built this map has been deleted;
-- `ANTHROPIC_API_KEY`, for stages 09 and 10;
-- a local Chrome, for stage 12.
+- `ANTHROPIC_API_KEY`, for stages 09, 10 and 11;
+- a local Chrome, for stage 13.
 
 ```bash
 uv run python pipeline/00_scrape_dependents.py umap-learn    # about an hour: GitHub throttles these pages
@@ -104,18 +118,22 @@ uv run python pipeline/07_embed.py umap-learn                # about 40 minutes 
 uv run python pipeline/08_reduce.py umap-learn
 uv run python pipeline/09_enrich.py umap-learn --pilot 60    # read the outputs before the batch
 uv run python pipeline/09_enrich.py umap-learn
-uv run python pipeline/10_label.py umap-learn --explore      # region counts at a few settings
-uv run python pipeline/10_label.py umap-learn --dry-run      # cost estimate
-uv run python pipeline/10_label.py umap-learn
-uv run python pipeline/11_render.py umap-learn
-uv run python pipeline/12_social_preview.py umap-learn
+uv run python pipeline/10_describe_usage.py umap-learn --pilot 50   # read the answers against the code
+uv run python pipeline/10_describe_usage.py umap-learn --limit 300  # a probe: does a batch find the cached instructions?
+uv run python pipeline/10_describe_usage.py umap-learn
+uv run python pipeline/11_label.py umap-learn --explore      # region counts at a few settings
+uv run python pipeline/11_label.py umap-learn --dry-run      # cost estimate
+uv run python pipeline/11_label.py umap-learn
+uv run python pipeline/12_render.py umap-learn
+uv run python pipeline/13_social_preview.py umap-learn
 uv run python pipeline/build_index.py                        # the page that lists the maps
 ```
 
 For umap-learn the paid steps came to about $21 for the summaries and categories, $2
 for the region names, and about $1.30 of RunPod GPU time. That build embedded and
 summarised all 10,509 candidates, before the filter existed; naming the regions again
-for the filtered map cost another $1.50.
+for the filtered map cost another $1.50. Describing how the 5,031 calling projects use
+UMAP, from their code, cost about $17 with Sonnet 5.5.
 
 The rendered map loads its data from files beside it, so it has to be served over HTTP
 to view locally:
@@ -137,10 +155,12 @@ a title. Then run the stages with the new target's slug. Its data goes to
 `data/<slug>/` and its map to `docs/<slug>/`, and `build_index.py` adds it to the list
 at `docs/index.html`.
 
-Three things are still specific to umap-learn and would need generalising: the enrichment
-prompt in `09_enrich.py` (it describes UMAP and asks what UMAP is used for), the PyPI
+Four things are still specific to umap-learn and would need generalising: the enrichment
+prompt in `09_enrich.py` (it describes UMAP and asks what UMAP is used for), the prompt in
+`10_describe_usage.py` (it describes UMAP and the uses its output is put to), the PyPI
 lookup in stage 01, which assumes a Python package, and stages 04 and 05, which read
-Python's dependency files and Python source.
+Python's dependency files and Python source. What the map shows of a library's features
+and arguments is set per target, in `config.py`.
 
 ## License
 

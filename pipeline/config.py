@@ -143,6 +143,18 @@ class Target:
         return self.data_dir / "code_usage.parquet"
 
     @property
+    def usage_log(self) -> Path:
+        return self.data_dir / "usage_descriptions.jsonl"
+
+    @property
+    def usage_batch_json(self) -> Path:
+        return self.data_dir / "usage_batch.json"
+
+    @property
+    def usage_parquet(self) -> Path:
+        return self.data_dir / "usage_descriptions.parquet"
+
+    @property
     def labels_parquet(self) -> Path:
         return self.data_dir / "labels.parquet"
 

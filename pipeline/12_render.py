@@ -1,11 +1,13 @@
 """Render the interactive map to docs/<target>/index.html, which GitHub Pages serves.
 
-Everything on the page is metadata or model-written text: names, star counts, dates,
-the generated one-sentence summary and the categories. README text stays out of the
+The page holds metadata (names, star counts, dates), model-written text (the one-sentence
+summary, the categories, and a sentence on how each project uses the library), and a few
+facts read from each project's code and dependency files: the call it makes most often,
+the names of what it calls, and the version it asks for. README text stays out of the
 page; it is in the embeddings, not the HTML.
 
 Usage:
-    uv run python pipeline/11_render.py umap-learn
+    uv run python pipeline/12_render.py umap-learn
     uv run python pipeline/build_index.py    # refresh the page that lists the maps
 """
 
@@ -94,6 +96,12 @@ UNREADABLE = "Not readable"
 SEVERAL = "Several values"
 CALL_NEUTRALS = {NO_CALL: "#e2e2e2", NO_FEATURE: "#c4c4c4", UNREADABLE: "#a8a8a8"}
 DEFAULT_GREY = CALL_NEUTRALS[NO_FEATURE]
+# The same for the two colormaps drawn from stage 10's reading of the code, where the
+# non-answers are no call and a call whose purpose or data the code does not show.
+CANT_TELL = usage.Purpose.UNKNOWN.value
+USE_NEUTRALS = {NO_CALL: "#e2e2e2", CANT_TELL: "#a8a8a8"}
+# What a README can say of the library's use that is worth a card's space.
+README_SILENT = ("Not mentioned", "Listed only")
 # A value that fewer projects than this give shares "Other" with the rest of the rare ones.
 MIN_VALUE_PROJECTS = 20
 GIVEN_LABELS = {
@@ -129,7 +137,7 @@ LISTED_IN_OVERRIDES = {"Lock file only": "#51d400"}
 # same layout: domain pill, name, labelled fields, then the summary and a footer. The
 # fields sit above the summary because summaries vary in length; below it they would
 # land at a different height on every card. "In code" is the last field for the same
-# reason: it runs from one line to four.
+# reason: it runs from one line to seven, with the sentence on what the call is for.
 DOT = (
     "display: inline-block; width: 8px; height: 8px; border-radius: 50%; "
     "margin-right: 6px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.15); "
@@ -142,6 +150,7 @@ CODE = (
 )
 # Under a row's value and in line with its text, past the dot.
 NOTE = "color: #6b7280; font-size: 11px; margin-left: 14px;"
+SENTENCE = "margin: 4px 0 0 14px;"
 HOVER_TEMPLATE = f"""
 <div style="max-width: 340px; white-space: normal; font-weight: 400; color: #1f2328;">
   <span style="display: inline-block; padding: 1px 8px; margin-bottom: 5px;
@@ -154,7 +163,9 @@ HOVER_TEMPLATE = f"""
     <div style="{FIELD_NAME}">Type</div>
     <div><span style="{DOT.format(color="{type_dot}")}"></span>{{project_type}}</div>
     <div style="{FIELD_NAME}">UMAP use</div>
-    <div><span style="{DOT.format(color="{role_dot}")}"></span>{{umap_role}}</div>
+    <div><span style="{DOT.format(color="{use_dot}")}"></span>{{umap_use}}</div>
+    <div style="{FIELD_NAME}">Data</div>
+    <div><span style="{DOT.format(color="{data_dot}")}"></span>{{data}}</div>
     <div style="{FIELD_NAME}">Listed in</div>
     <div><span style="{DOT.format(color="{listed_dot}")}"></span>{{listed_in}}</div>
     <div style="{FIELD_NAME}">In code</div>
@@ -356,7 +367,7 @@ def call_text(call: dict) -> str:
     return f"{call['name'].rsplit('.', 1)[-1]}({', '.join(parts)})"
 
 
-def code_detail(row, category: str, calls: list[dict], features: list[str]) -> str:
+def code_detail(row, category: str, calls: list[dict], features: list[str], sentence: str) -> str:
     """The category with what a card has room to add, as HTML."""
     if row.code_use == "Another library's":
         # The function that computes a layout, before the one that plots it; or, for a
@@ -383,7 +394,36 @@ def code_detail(row, category: str, calls: list[dict], features: list[str]) -> s
         shown = html.escape(f"{category} ({row.called[0]})" if len(row.called) else category)
     if features:
         notes.append("Features: " + ", ".join(features))
-    return shown + "".join(f'<div style="{NOTE}">{html.escape(note)}</div>' for note in notes)
+    shown += "".join(f'<div style="{NOTE}">{html.escape(note)}</div>' for note in notes)
+    if sentence:
+        # Stage 10's account of what goes in and what becomes of the result.
+        shown += f'<div style="{SENTENCE}">{html.escape(sentence)}</div>'
+    return shown
+
+
+def use_detail(row, shown: str, purposes: list[str]) -> str:
+    """Every purpose the code shows, the one the map colours by first."""
+    if row.code_use != "Calls it":
+        # No call to read a purpose from. What the README says of it is the next best.
+        stated = isinstance(row.umap_role, str) and row.umap_role not in README_SILENT
+        return f"{row.umap_role} (per README)" if stated else shown
+    if shown == usage.PLOTTED_AND_CLUSTERED:
+        return shown
+    return ", ".join([shown, *(p for p in purposes if p != shown)])
+
+
+def data_detail(row, shown: str) -> str:
+    """The kind of data with the form it arrives in, or the model's own words for a kind
+    the list lacks."""
+    if row.code_use != "Calls it" or row.usage_status != "ok":
+        return shown
+    if shown == usage.InputData.OTHER.value and row.input_detail.strip():
+        detail = row.input_detail.strip()
+        return detail[:1].upper() + detail[1:]
+    silent = (usage.InputForm.ANY.value, usage.InputForm.UNKNOWN.value)
+    if shown in (usage.InputData.ANY.value, CANT_TELL) or row.input_form in silent:
+        return shown
+    return f"{shown} · {row.input_form.lower()}"
 
 
 def call_categories(
@@ -520,7 +560,7 @@ def load(target: Target) -> pd.DataFrame:
     # Labels carry the layout, so labels left from an earlier corpus would draw this one in
     # the wrong places without any error.
     assert set(labels["doc_id"]) == set(documents["doc_id"]), (
-        "labels.parquet is for a different set of documents; run stage 10 again"
+        "labels.parquet is for a different set of documents; run stage 11 again"
     )
     df = documents.merge(labels, on="doc_id", how="left", validate="one_to_one")
     df = df.merge(enrichment, on="doc_id", how="left", validate="one_to_one")
@@ -557,6 +597,24 @@ def load(target: Target) -> pd.DataFrame:
     df = df.merge(code, on="doc_id", how="left", validate="one_to_one")
     # A project whose code was not read has no answer here, which is not a yes.
     df["fits_with_target"] = df["fits_with_target"].astype("boolean").fillna(False).astype(bool)
+    described = pd.read_parquet(
+        target.usage_parquet,
+        columns=[
+            "doc_id",
+            "status",
+            "input_data",
+            "input_form",
+            "input_detail",
+            "purposes",
+            "usage_summary",
+        ],
+    ).rename(columns={"status": "usage_status"})
+    df = df.merge(described, on="doc_id", how="left", validate="one_to_one")
+    # Stage 10 describes the repositories whose code calls the library, and no others.
+    calling = (df["code_use"] == "Calls it") & (df["source"] == "github")
+    assert df.loc[calling, "usage_status"].notna().all(), (
+        "calling projects stage 10 has not described; run it again"
+    )
     assert len(df) == len(documents), "merge changed the row count"
     assert df["declaration_status"].notna().all(), "documents stage 04 has not read"
     assert df["code_use"].notna().all(), "documents stage 05 has not read"
@@ -589,9 +647,27 @@ def main() -> None:
     type_values, type_meta, type_colors = categorical_colormap(
         "project_type", "Project type", df["project_type"]
     )
-    role_values, role_meta, role_colors = categorical_colormap(
-        "umap_role", "UMAP use (per README)", df["umap_role"]
+    # What the code does with the library's output, and what it feeds it, as stage 10 read
+    # them. One purpose a project; the card and the search text have them all.
+    calls_it = (df["code_use"] == "Calls it").to_numpy()
+    described = (df["usage_status"] == "ok").to_numpy()
+    purposes = [list(p) if ok else [] for p, ok in zip(df["purposes"], described, strict=True)]
+    use_category = pd.Series(
+        [
+            (one or CANT_TELL) if direct else NO_CALL
+            for one, direct in zip(usage.shown_purpose(purposes), calls_it, strict=True)
+        ]
     )
+    use_values, use_meta, use_colors = categorical_colormap(
+        "umap_use", f"{target.name} use", use_category, neutrals=USE_NEUTRALS
+    )
+    data_values, data_meta, data_colors = categorical_colormap(
+        "input_data",
+        f"Data {target.name} reduces",
+        pd.Series(np.where(calls_it, df["input_data"].fillna(CANT_TELL), NO_CALL)),
+        neutrals=USE_NEUTRALS,
+    )
+    sentences = df["usage_summary"].fillna("").str.strip().where(described, "")
     code_values, code_meta, code_colors = categorical_colormap(
         "in_code", f"{target.name} in the code", code_category(df, target.name)
     )
@@ -608,7 +684,6 @@ def main() -> None:
     )
 
     # How the code calls the library, for the projects whose code calls it at all.
-    calls_it = (df["code_use"] == "Calls it").to_numpy()
     calls = [usage.constructor_calls(project) for project in df["calls"]]
     features = [
         usage.features_used(
@@ -622,7 +697,7 @@ def main() -> None:
     shown_feature = [
         (feature or NO_FEATURE) if direct else NO_CALL
         for feature, direct in zip(
-            usage.rarest_feature(features, target.features), calls_it, strict=True
+            usage.rarest(features, [f.label for f in target.features]), calls_it, strict=True
         )
     ]
     call_values, call_metas = [], []
@@ -666,12 +741,20 @@ def main() -> None:
             "pill_fg": [pills[v][1] for v in domain_values],
             "project_type": type_label.map(html.escape),
             "type_dot": [type_colors[v] for v in type_values],
-            "umap_role": pd.Series(role_values).map(html.escape),
-            "role_dot": [role_colors[v] for v in role_values],
+            "umap_use": [
+                html.escape(use_detail(row, shown, found))
+                for row, shown, found in zip(df.itertuples(), use_values, purposes, strict=True)
+            ],
+            "use_dot": [use_colors[v] for v in use_values],
+            "data": [
+                html.escape(data_detail(row, shown))
+                for row, shown in zip(df.itertuples(), data_values, strict=True)
+            ],
+            "data_dot": [data_colors[v] for v in data_values],
             "in_code": [
-                code_detail(row, category, c, f)
-                for row, category, c, f in zip(
-                    df.itertuples(), code_values, calls, features, strict=True
+                code_detail(row, category, c, f, sentence)
+                for row, category, c, f, sentence in zip(
+                    df.itertuples(), code_values, calls, features, sentences, strict=True
                 )
             ],
             "code_dot": [code_colors[v] for v in code_values],
@@ -703,14 +786,27 @@ def main() -> None:
                         # show one of: "metric=cosine" finds each project that sets it.
                         " ".join([*used, *usage.argument_tokens(c)]),
                         " ".join([*row.import_forms, *row.signals]),
+                        # What stage 10 read in the code: the purposes, the data, and the
+                        # sentence, which names the models and methods beside the call.
+                        " ".join([*found, sentence])
+                        + (f" {row.input_data} {row.input_form} {row.input_detail}" if ok else ""),
                         # The requirement as pip would write it: "umap-learn>=0.5".
                         f"{target.package}{row.version_spec}"
                         if isinstance(row.version_spec, str) and row.version_spec[:1] in SPEC_STARTS
                         else "",
                     ]
                 )
-                for row, text, domain, kind, used, c in zip(
-                    df.itertuples(), summary, domain_label, type_label, features, calls, strict=True
+                for row, text, domain, kind, used, c, found, sentence, ok in zip(
+                    df.itertuples(),
+                    summary,
+                    domain_label,
+                    type_label,
+                    features,
+                    calls,
+                    purposes,
+                    sentences,
+                    described,
+                    strict=True,
                 )
             ],
         }
@@ -753,7 +849,8 @@ def main() -> None:
         colormap_rawdata=[
             domain_values,
             type_values,
-            role_values,
+            use_values,
+            data_values,
             code_values,
             *call_values,
             listed_values,
@@ -768,7 +865,8 @@ def main() -> None:
         colormap_metadata=[
             domain_meta,
             type_meta,
-            role_meta,
+            use_meta,
+            data_meta,
             code_meta,
             *call_metas,
             listed_meta,

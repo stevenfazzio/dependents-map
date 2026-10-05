@@ -1,14 +1,16 @@
 """How each project calls the library, reduced to what one point on a map can show.
 
-Stage 05 records every call a project makes to the library's classes. A point has one
-colour per colormap and a project can make many calls, with different arguments, so each
-function here has a rule for turning several calls into one answer. What a rule leaves
-out stays on the hovercard and in the search text.
+Stage 05 records every call a project makes to the library's classes, and stage 10 every
+purpose its code puts the result to. A point has one colour per colormap and a project
+can make many calls, with different arguments and for several purposes, so each function
+here has a rule for turning several answers into one. What a rule leaves out stays on the
+hovercard and in the search text.
 """
 
 import json
 import re
 from collections import Counter
+from enum import StrEnum
 
 from code_usage import EXPRESSION
 from config import Feature
@@ -20,6 +22,43 @@ EVERY, SOME, NEVER = "every", "some", "never"
 
 # A value longer than this, in the search text, is somebody's path or sentence.
 MAX_TOKEN_VALUE = 40
+
+
+# The answers stage 10 asks the model to choose among, which are also the map's legends.
+class InputData(StrEnum):
+    TEXT = "Text"
+    IMAGES = "Images or video"
+    AUDIO = "Audio or speech"
+    OMICS = "Omics or biological sequences"
+    MOLECULES = "Molecules or materials"
+    TABULAR = "Tabular or sensor data"
+    GRAPH = "Graphs or networks"
+    MODEL = "Model internals"
+    ANY = "Whatever the caller passes"
+    OTHER = "Other"
+    UNKNOWN = "Can't tell"
+
+
+class InputForm(StrEnum):
+    NEURAL = "Neural embeddings"
+    ENGINEERED = "Engineered features"
+    RAW = "Raw measurements"
+    DISTANCES = "Distances or a graph"
+    ANY = "Whatever the caller passes"
+    UNKNOWN = "Can't tell"
+
+
+class Purpose(StrEnum):
+    VISUALIZATION = "Visualization"
+    CLUSTERING = "Clustering input"
+    FEATURES = "Features for a model"
+    OFFERED = "Offered to its own users"
+    EVALUATION = "Evaluation or comparison"
+    OTHER = "Other"
+    UNKNOWN = "Can't tell"
+
+
+PLOTTED_AND_CLUSTERED = "Visualization and clustering"
 
 
 def constructor_calls(calls) -> list[dict]:
@@ -53,16 +92,31 @@ def features_used(
     return [feature.label for feature in features if holds(feature)]
 
 
-def rarest_feature(used: list[list[str]], features: tuple[Feature, ...]) -> list[str | None]:
-    """One feature per project: of those it uses, the one the fewest projects use.
+def rarest(used: list[list[str]], order: list[str]) -> list[str | None]:
+    """One label per project: of those it has, the one the fewest projects have.
 
     Nearly every project with two features pairs a common one with a rare one. Showing
-    the rare one keeps each rare feature's projects together under its colour, and takes
-    them from the common one, which has projects to spare. Ties go to config's order.
+    the rare one keeps each rare label's projects together under its colour, and takes
+    them from the common one, which has projects to spare. Ties go to `order`.
     """
     counts = Counter(label for labels in used for label in labels)
-    rank = {feature.label: (counts[feature.label], i) for i, feature in enumerate(features)}
+    rank = {label: (counts[label], i) for i, label in enumerate(order)}
     return [min(labels, key=rank.__getitem__) if labels else None for labels in used]
+
+
+def shown_purpose(purposes: list[list[str]]) -> list[str | None]:
+    """One purpose per project, from all that its code shows.
+
+    Plotting the result and clustering it is by far the commonest pairing, half of all
+    projects with two purposes on umap-learn, and a pattern in its own right, so it has a
+    name of its own. Any other combination is shown by its rarest member.
+    """
+    pair = {Purpose.VISUALIZATION.value, Purpose.CLUSTERING.value}
+    single = rarest(purposes, [purpose.value for purpose in Purpose])
+    return [
+        PLOTTED_AND_CLUSTERED if set(labels) == pair else one
+        for labels, one in zip(purposes, single, strict=True)
+    ]
 
 
 def value_given(calls: list[dict], parameter: str) -> tuple[str, object]:
