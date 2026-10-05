@@ -82,6 +82,80 @@ def name_pattern(target: Target) -> re.Pattern:
     )
 
 
+VERSION_KINDS = [
+    "One version",
+    "Compatible releases",
+    "Bounded range",
+    "Lower bound",
+    "Upper bound",
+    "Any version",
+    "From source",
+]
+_CLAUSE = r"(?:===|==|~=|!=|<=|>=|<|>|=)\s*[\w.*+!]+"
+
+
+def specifiers(text: str, target: Target) -> list[str]:
+    """Every version specifier a requirement text gives the package, without spaces.
+
+    "" stands for the package named with no version, and "from source" for a URL.
+    """
+    name = "[-_.]".join(re.escape(part) for part in re.split(r"[-_.]+", target.package))
+    found = set()
+    requirement = (
+        rf"(?<![\w.-]){name}(?!\w|-[A-Za-z])\s*(?:\[[^\]]*\])?\s*(@|(?:{_CLAUSE}\s*,?\s*)*)"
+    )
+    for match in re.finditer(requirement, text, re.IGNORECASE):
+        spec = re.sub(r"\s+", "", match.group(1)).rstrip(",")
+        if spec == "@":
+            spec = "from source"
+        elif re.match(r"=[^=]", spec):  # conda: name=version, or name=version=build
+            spec = "==" + spec[1:].split("=")[0]
+        found.add(spec)
+    if re.search(rf"github\.com[/:]{re.escape(target.repo)}(?![\w-])", text, re.IGNORECASE):
+        found.add("from source")
+    return sorted(found)
+
+
+def poetry_specifier(value) -> str | None:
+    """The specifier in a Poetry or Pipfile entry, whose key is the package's name."""
+    if isinstance(value, dict):
+        if {"git", "path", "url", "file"} & set(value):
+            return "from source"
+        value = value.get("version", "")
+    if not isinstance(value, str):
+        return None
+    spec = re.sub(r"\s+", "", value)
+    if spec in ("", "*"):
+        return ""
+    return f"=={spec}" if spec[0].isdigit() else spec  # a bare version is an exact one
+
+
+def version_kind(spec: str | None) -> tuple[str | None, str | None]:
+    """What a specifier allows, and the version it is anchored on."""
+    if spec is None:
+        return None, None
+    if spec == "from source":
+        return "From source", None
+    if spec == "":
+        return "Any version", None
+    clauses = spec.split(",")
+    anchor = re.sub(r"^[=<>!~^]+", "", clauses[0])
+    if len(clauses) == 1 and clauses[0].startswith("==") and "*" not in clauses[0]:
+        return "One version", anchor
+    if any(c.startswith(("^", "~")) or "*" in c for c in clauses):
+        return "Compatible releases", anchor
+    lower = [c for c in clauses if c.startswith(">")]
+    upper = [c for c in clauses if c.startswith("<")]
+    floor = re.sub(r"^[=<>!~^]+", "", lower[0]) if lower else None
+    if lower and upper:
+        return "Bounded range", floor
+    if lower:
+        return "Lower bound", floor
+    if upper:
+        return "Upper bound", re.sub(r"^[=<>!~^]+", "", upper[0])
+    return "One version" if clauses[0].startswith("==") else "Any version", anchor
+
+
 def is_lock_name(base: str) -> bool:
     return base in TOML_LOCKS or bool(re.search(r"lock|freeze|frozen|constraint", base))
 
@@ -103,13 +177,14 @@ def via_notes(lines: list[str], i: int) -> list[str]:
     return [item.strip() for note in notes for item in note.split(",") if item.strip()]
 
 
-def read_lines(base: str, text: str, pattern: re.Pattern) -> dict:
+def read_lines(base: str, text: str, target: Target, pattern: re.Pattern) -> dict:
     """Read a requirements file, a conda environment, setup.py or setup.cfg line by line."""
     lines = text.splitlines()
     hits = [i for i, line in enumerate(lines) if pattern.search(strip_comment(line))]
     if not hits:
         return {"named": False}
     out = {"named": True, "direct": True, "lines": [lines[i].strip()[:200] for i in hits[:5]]}
+    out["specs"] = specifiers("\n".join(strip_comment(lines[i]) for i in hits), target)
 
     if base.startswith("setup."):
         before = "\n".join(lines[: hits[0] + 1])
@@ -171,6 +246,7 @@ def read_toml_manifest(text: str, target: Target, pattern: re.Pattern) -> dict:
     """Read pyproject.toml, Pipfile or pixi.toml: every key path that names the package."""
     wanted = normalize(target.package)
     found: dict[str, str] = {}
+    specs: set[str] = set()
 
     def walk(node, path: tuple[str, ...]) -> None:
         if isinstance(node, dict):
@@ -178,6 +254,8 @@ def read_toml_manifest(text: str, target: Target, pattern: re.Pattern) -> dict:
                 if normalize(key) == wanted and (scope := declaration_scope(path)):
                     optional = isinstance(value, dict) and value.get("optional")
                     found[".".join(path)] = "optional" if optional else scope
+                    if (spec := poetry_specifier(value)) is not None:
+                        specs.add(spec)
                 walk(value, (*path, key))
         elif isinstance(node, list):
             for item in node:
@@ -185,12 +263,19 @@ def read_toml_manifest(text: str, target: Target, pattern: re.Pattern) -> dict:
         elif isinstance(node, str) and pattern.search(node):
             if scope := declaration_scope(path):
                 found[".".join(path)] = scope
+                specs.update(specifiers(node, target))
 
     walk(tomllib.loads(text), ())
     if not found:
         return {"named": False}
     scope = min(found.values(), key=SCOPES.index)
-    return {"named": True, "direct": True, "scope": scope, "where": sorted(found)}
+    return {
+        "named": True,
+        "direct": True,
+        "scope": scope,
+        "where": sorted(found),
+        "specs": sorted(specs),
+    }
 
 
 def requirement_names(package: dict) -> set[str]:
@@ -253,7 +338,7 @@ def analyze(target: Target, path: str, text: str) -> dict:
             return {"named": named, "direct": None}  # Pipfile.lock records no requirers
     except (tomllib.TOMLDecodeError, json.JSONDecodeError, AttributeError, TypeError):
         pass  # malformed, or cut short: fall back to reading it as lines
-    out = read_lines(base, text, pattern)
+    out = read_lines(base, text, target, pattern)
     if out["named"] and base in TOML_LOCKS | {"pipfile.lock"}:
         out |= {"direct": None, "unparsed": True}
     return out
@@ -461,6 +546,15 @@ def classify(target: Target, files: list[dict]) -> dict:
 
     listings = [f for f in direct if "entries" in f]
     longest = max(listings, key=lambda f: f["entries"], default={})
+    dumps = [f for f in listings if f["lists_llvmlite"] or f["lists_pynndescent"]]
+    # The specifier the project wrote: from a list someone wrote before a dumped
+    # environment, the shallowest file first, and the most specific one in it.
+    spec = None
+    for f in sorted(direct, key=lambda f: (f in dumps, f["path"].count("/"), f["path"])):
+        if f.get("specs"):
+            spec = max(f["specs"], key=lambda s: (s not in ("", "from source"), len(s)))
+            break
+    kind, version = version_kind(spec)
     return {
         "status": status,
         "declared_in": [f["path"] for f in direct],
@@ -469,9 +563,10 @@ def classify(target: Target, files: list[dict]) -> dict:
         "scope": min((f["scope"] for f in direct if "scope" in f), key=SCOPES.index, default=None),
         # Declared only in requirement listings that also name the package's own
         # dependencies: an environment written out, not a list someone wrote.
-        "dumped": bool(direct)
-        and len(listings) == len(direct)
-        and all(f["lists_llvmlite"] or f["lists_pynndescent"] for f in listings),
+        "dumped": bool(direct) and len(dumps) == len(direct),
+        "version_spec": spec,
+        "version_kind": kind,
+        "version": version,
         "listing_entries": longest.get("entries"),
         "listing_pinned": longest.get("pinned"),
         "n_files_read": len(files),
@@ -483,12 +578,21 @@ def build_table(
     target: Target, documents: pd.DataFrame, root: dict, trees: dict, remaining: dict
 ) -> pd.DataFrame:
     rows = []
+    pypi = pd.read_parquet(target.pypi_parquet, columns=["pypi_name", "requires_dist"])
+    requires = {
+        name: list(reqs) if reqs is not None else []
+        for name, reqs in zip(pypi["pypi_name"], pypi["requires_dist"], strict=True)
+    }
     for row in documents.itertuples():
         out = {"doc_id": row.doc_id, "basis": "repository files"}
         if row.source != "github":
             out["basis"] = "PyPI metadata"
             out["status"] = "not found" if row.target_dependency == "absent" else "declared"
             out["scope"] = None if row.target_dependency == "absent" else row.target_dependency
+            specs = specifiers("\n".join(requires.get(row.name, [])), target)
+            if specs and out["status"] == "declared":
+                out["version_spec"] = max(specs, key=lambda s: (s != "", len(s)))
+                out["version_kind"], out["version"] = version_kind(out["version_spec"])
         elif root.get(row.name, {}).get("status") != "ok":
             out["status"] = "unread"
         else:
@@ -511,6 +615,7 @@ def build_table(
     for column in ("declared_in", "locked_in", "via"):
         table[column] = table[column].map(lambda v: v if isinstance(v, list) else [])
     table["status"] = pd.Categorical(table["status"], STATUSES)
+    table["version_kind"] = pd.Categorical(table["version_kind"], VERSION_KINDS)
     for column in ("dumped", "listing_truncated", "vendored_copy"):
         table[column] = table[column].astype("boolean")
     counts = ("listing_entries", "listing_pinned", "n_files_read", "n_files_unread")
@@ -528,6 +633,17 @@ def report(table: pd.DataFrame) -> None:
     print(f"\nDeclared ({len(declared)}):")
     print(f"  scope: {declared['scope'].value_counts(dropna=False).to_dict()}")
     print(f"  only in a dumped environment: {declared['dumped'].sum()}")
+    for label, group in (
+        ("written", declared[~declared["dumped"]]),
+        ("dumped", declared[declared["dumped"]]),
+    ):
+        kinds = group["version_kind"].value_counts(dropna=False).to_dict()
+        print(f"  versions, {label}: {kinds}")
+        one = group.loc[group["version_kind"] == "One version", "version"]
+        print(f"    one version: {one.value_counts().head(12).to_dict()}")
+        floor = group.loc[group["version_kind"] == "Lower bound", "version"]
+        if len(floor):
+            print(f"    lower bound: {floor.value_counts().head(8).to_dict()}")
     kinds = Counter(
         p.rsplit("/", 1)[-1].lower() for paths in declared["declared_in"] for p in paths
     )

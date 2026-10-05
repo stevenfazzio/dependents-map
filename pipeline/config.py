@@ -25,6 +25,28 @@ class Carrier:
 
 
 @dataclass(frozen=True)
+class Signal:
+    """Something code does around the package that says how it gets on with it."""
+
+    label: str
+    pattern: str  # searched for in the files that name the package
+
+
+@dataclass(frozen=True)
+class Feature:
+    """A part of the library beyond building a model and fitting it, and the code that shows it.
+
+    A project has the feature when any of the conditions given here holds.
+    """
+
+    label: str
+    called: str = ""  # a pattern over the dotted names the project calls
+    method: str = ""  # a method called on one of the library's objects
+    argument: tuple[str, object] | None = None  # a constructor argument given this value
+    fit_with_target: bool = False  # fit or fit_transform handed a target as well
+
+
+@dataclass(frozen=True)
 class Target:
     """A project whose dependents we map."""
 
@@ -37,6 +59,12 @@ class Target:
     title: str  # the map's title
     # Libraries that run the package for a caller who never names it.
     carriers: tuple[Carrier, ...] = ()
+    signals: tuple[Signal, ...] = ()
+    features: tuple[Feature, ...] = ()
+    # Constructor arguments the map has a colormap for, as (argument, colormap name):
+    # coloured by the value a project gives, or by whether it gives one at all.
+    value_colormaps: tuple[tuple[str, str], ...] = ()
+    given_colormaps: tuple[tuple[str, str], ...] = ()
 
     @property
     def data_dir(self) -> Path:
@@ -135,6 +163,10 @@ class Target:
         return DOCS_DIR / self.slug / "meta.json"
 
 
+# A call to warnings.filterwarnings or simplefilter, and the arguments up to a given one.
+_SILENCE = r"(?:filterwarnings|simplefilter)\s*\("
+_ARGS = r"(?:[^()]|\([^()]*\))*?"
+
 TARGETS = {
     t.slug: t
     for t in [
@@ -156,6 +188,45 @@ TARGETS = {
                 # A speaker model brings in a clustering backend that calls umap.UMAP.
                 Carrier("FunASR speaker model", "funasr", r"\bspk_model\b"),
             ),
+            # Chosen from what 1,500 callers' files actually silence and set.
+            signals=(
+                Signal(
+                    "silences every warning",
+                    _SILENCE + r"\s*(?:action\s*=\s*)?[\"']ignore[\"']\s*\)",
+                ),
+                Signal(
+                    "silences the TensorFlow import warning",
+                    _SILENCE + _ARGS + r"Tensorflow not installed",
+                ),
+                Signal("silences the n_jobs warning", _SILENCE + _ARGS + r"n_jobs value"),
+                Signal(
+                    "silences other UMAP warnings",
+                    _SILENCE
+                    + _ARGS
+                    + r"(?:module\s*=\s*[\"']umap|precomputed metric|not fully connected"
+                    r"|force_all_finite)",
+                ),
+                Signal("silences numba warnings", _SILENCE + _ARGS + r"Numba\w*Warning"),
+                Signal("sets numba variables", r"NUMBA_[A-Z_]{3,}"),
+            ),
+            features=(
+                Feature("Transforms new data", method="transform"),
+                Feature("Inverse transform", method="inverse_transform"),
+                Feature("Supervised (fit with labels)", fit_with_target=True),
+                Feature("Precomputed metric", argument=("metric", "precomputed")),
+                Feature("DensMAP", argument=("densmap", True)),
+                Feature("Parametric UMAP", called=r"ParametricUMAP"),
+                Feature("Aligned UMAP", called=r"AlignedUMAP|^umap\.aligned_umap\."),
+                Feature("umap.plot", called=r"^umap\.plot\."),
+                # The functions the classes are built from, such as fuzzy_simplicial_set:
+                # anything in a submodule that is not a class and not counted above.
+                Feature(
+                    "Lower-level functions",
+                    called=r"^umap\.(?!plot\.|parametric_umap\.|aligned_umap\.|[A-Z])\w+\.\w",
+                ),
+            ),
+            value_colormaps=(("metric", "Distance metric"),),
+            given_colormaps=(("random_state", "Random seed"),),
             title="UMAP Dependents Map",
         ),
     ]

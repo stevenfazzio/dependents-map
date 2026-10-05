@@ -10,13 +10,18 @@ The reading is of the syntax tree where the text parses as Python 3. Notebook ce
 do not (shell cells, Python 2) are read with regular expressions instead, which finds the
 imports and the calls but follows nothing.
 
-Nothing here looks at what a variable holds when the code runs, so an argument passed as
-a variable is reported as "<expr>", and a class reached through a wrapper is not seen.
+Nothing here runs the code. An argument passed as a variable is followed to a value only
+where the file gives that variable one constant and nothing else: a single assignment, a
+function parameter's default, a command-line option's default, or an entry in a dict
+that is unpacked into the call. Such a value is what the code uses unless a caller says
+otherwise, and it is marked as followed. Anything else is reported as "<expr>", and a
+class reached through a wrapper is not seen.
 """
 
 import ast
 import functools
 import importlib.util
+import json
 import re
 import warnings
 from pathlib import Path
@@ -44,6 +49,9 @@ ESTIMATOR_ATTRS = {
     "graph_",
 }
 MAX_CALL_CHARS = 3000
+# How many variables a value is followed through: `self.k = k`, where k has a default.
+MAX_FOLLOW = 3
+IMPORT_ERRORS = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
 
 
 @functools.cache
@@ -119,6 +127,33 @@ def _literal(node: ast.AST):
     return value if isinstance(value, str | int | float | bool | type(None)) else EXPRESSION
 
 
+@functools.cache
+def class_signature(module: str, class_name: str) -> tuple[tuple[str, ...], dict] | None:
+    """A library class's constructor parameters, in order, and their constant defaults.
+
+    Read from the installed library's source without importing it, so that positional
+    arguments can be given their names and an argument left out can be given its value.
+    None if the library is not installed or has no such class.
+    """
+    try:
+        spec = importlib.util.find_spec(module)
+    except (ImportError, ValueError):
+        return None
+    if spec is None or spec.origin is None:
+        return None
+    for path in sorted(Path(spec.origin).parent.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(node, ast.ClassDef) and node.name == class_name):
+                continue
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                    names = [arg.arg for arg in item.args.args[1:]]
+                    defaults = [_literal(default) for default in item.args.defaults]
+                    with_defaults = names[len(names) - len(defaults) :]
+                    return tuple(names), dict(zip(with_defaults, defaults, strict=True))
+    return None
+
+
 class _Reader:
     """Reads the parsed chunks of one file, which share their imports and variables."""
 
@@ -128,6 +163,13 @@ class _Reader:
         self.aliases: dict[str, str] = {}  # name in the file -> what it was imported as
         self.instances: dict[str, str] = {}  # variable -> the class it was built from
         self.rebound: set[str] = set()  # variables also assigned something else
+        # Every value the file gives a variable; None stands for one it does not show,
+        # such as a parameter with no default or a loop variable.
+        self.assigned: dict[str, list[ast.AST | None]] = {}
+        self.options: dict[str, list[ast.AST]] = {}  # command-line option -> its defaults
+        self.import_forms: set[str] = set()
+        self.guarded = False  # imported inside a try that catches a failed import
+        self.lazy = False  # imported inside a function
         self.star = False
         self.names: set[str] = set()
         self.calls: list[dict] = []
@@ -183,33 +225,146 @@ class _Reader:
         return None
 
     def collect_imports(self, tree: ast.AST) -> None:
-        for node in ast.walk(tree):
+        nodes = list(ast.walk(tree))
+        parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+        for node in nodes:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     top = alias.name.split(".")[0]
                     self.aliases[alias.asname or top] = alias.name if alias.asname else top
+                    if top == self.module:
+                        # The one alias worth keeping: a submodule under the library's name.
+                        renamed = f" as {alias.asname}" if alias.asname == self.module else ""
+                        dotted = alias.name != self.module
+                        self.note_import(
+                            node, f"import {alias.name}{renamed if dotted else ''}", parents
+                        )
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                ours = node.module.split(".")[0] == self.module
                 for alias in node.names:
                     if alias.name == "*":
-                        self.star = self.star or node.module.split(".")[0] == self.module
+                        self.star = self.star or ours
                     else:
                         self.aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+                    if ours:
+                        self.note_import(node, f"from {node.module} import {alias.name}", parents)
 
-    def collect_instances(self, tree: ast.AST) -> None:
+    def note_import(self, node: ast.AST, form: str, parents: dict) -> None:
+        """Record how the library is imported, and whether warily or late."""
+        self.import_forms.add(form)
+        child, parent = node, parents.get(node)
+        while parent is not None:
+            if isinstance(parent, ast.Try) and child in parent.body:
+                caught = {
+                    name.id if isinstance(name, ast.Name) else getattr(name, "attr", "")
+                    for handler in parent.handlers
+                    for name in (
+                        handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+                    )
+                    if name is not None
+                }
+                bare = any(handler.type is None for handler in parent.handlers)
+                self.guarded = self.guarded or bare or bool(caught & IMPORT_ERRORS)
+            elif isinstance(parent, ast.FunctionDef | ast.AsyncFunctionDef):
+                self.lazy = True
+            child, parent = parent, parents.get(parent)
+
+    def collect_assignments(self, tree: ast.AST) -> None:
+        """Note what each variable is given: the objects built from the library, and the
+        values a later argument can be followed to."""
         for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                self.note_parameters(node.args)
+            elif isinstance(node, ast.Call):
+                self.note_option(node)
+            elif isinstance(node, ast.AugAssign | ast.For | ast.AsyncFor | ast.comprehension):
+                self.note_values(node.target, None)
+            elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+                self.note_values(node.optional_vars, None)
+
             if isinstance(node, ast.Assign):
                 targets, value = node.targets, node.value
-            elif isinstance(node, ast.AnnAssign | ast.NamedExpr):
+            elif isinstance(node, ast.AnnAssign | ast.NamedExpr) and node.value is not None:
                 targets, value = [node.target], node.value
             else:
                 continue
             built = self.constructed(value) if isinstance(value, ast.Call) else None
             for target in targets:
+                self.note_values(target, value)
                 if chain := _chain(target):
                     if built:
                         self.instances[chain] = built
                     else:
                         self.rebound.add(chain)
+
+    def note_values(self, target: ast.AST, value: ast.AST | None) -> None:
+        if isinstance(target, ast.Tuple | ast.List):
+            for element in target.elts:  # unpacked: which value goes where is not followed
+                self.note_values(element, None)
+        elif chain := _chain(target):
+            self.assigned.setdefault(chain, []).append(value)
+
+    def note_parameters(self, args: ast.arguments) -> None:
+        positional = [*args.posonlyargs, *args.args]
+        defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        pairs = [*zip(positional, defaults, strict=True)]
+        pairs += zip(args.kwonlyargs, args.kw_defaults, strict=True)
+        pairs += [(arg, None) for arg in (args.vararg, args.kwarg) if arg is not None]
+        for arg, default in pairs:
+            self.assigned.setdefault(arg.arg, []).append(default)
+
+    def note_option(self, node: ast.Call) -> None:
+        """Record the default of an argparse or click option: `args.k` is read from it."""
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr not in ("add_argument", "option", "add_option"):
+            return
+        keywords = {k.arg: k.value for k in node.keywords if k.arg}
+        if "default" not in keywords:
+            return
+        flags = [_literal(arg) for arg in node.args]
+        flags = [f for f in flags if isinstance(f, str) and f.startswith("-")]
+        dest = _literal(keywords["dest"]) if "dest" in keywords else None
+        if not isinstance(dest, str):
+            if not flags:
+                return
+            dest = max(flags, key=len).lstrip("-").replace("-", "_")
+        self.options.setdefault(dest, []).append(keywords["default"])
+
+    def value_of(self, node: ast.AST, depth: int = 0) -> tuple[object, bool]:
+        """A node's constant value, and whether it was followed through a variable."""
+        value = _literal(node)
+        if value != EXPRESSION:
+            return value, depth > 0
+        chain = _chain(node)
+        if chain is None or depth >= MAX_FOLLOW:
+            return EXPRESSION, False
+        sources = self.assigned.get(chain)
+        if sources is None and isinstance(node, ast.Attribute):
+            sources = self.options.get(node.attr)  # args.n_neighbors, from --n_neighbors
+        if not sources or any(source is None for source in sources):
+            return EXPRESSION, False
+        found = {json.dumps(self.value_of(source, depth + 1)[0]) for source in sources}
+        if len(found) != 1 or json.loads(next(iter(found))) == EXPRESSION:
+            return EXPRESSION, False
+        return json.loads(found.pop()), True
+
+    def unpacked(self, node: ast.AST) -> tuple[list[tuple[str, ast.AST]], bool] | None:
+        """The entries of a dict unpacked into a call with `**`, and whether it was a variable."""
+        via_variable = False
+        if chain := _chain(node):
+            sources = self.assigned.get(chain)
+            if not sources or len(sources) != 1 or sources[0] is None:
+                return None
+            node, via_variable = sources[0], True
+        if isinstance(node, ast.Dict):
+            keys = [_literal(key) if key is not None else None for key in node.keys]
+            if all(isinstance(key, str) for key in keys):
+                return list(zip(keys, node.values, strict=True)), via_variable
+        elif isinstance(node, ast.Call) and _chain(node.func) == "dict" and not node.args:
+            if all(k.arg for k in node.keywords):
+                return [(k.arg, k.value) for k in node.keywords], via_variable
+        return None
 
     def collect_uses(self, tree: ast.AST) -> None:
         nodes = list(ast.walk(tree))
@@ -245,18 +400,48 @@ class _Reader:
             return
         name = self.resolve(node.func)
         if self.ours(name):
-            self.calls.append(
-                {
-                    "name": name,
-                    "args": len(node.args),
-                    "kwargs": {k.arg: _literal(k.value) for k in node.keywords if k.arg},
-                    "star": any(k.arg is None for k in node.keywords),
-                }
-            )
+            self.calls.append(self.read_arguments(name, node))
         elif name and self.module in name.rsplit(".", 1)[-1].lower():
             # Another library's function or class named after this one: a wrapper around
             # it, or an implementation of its own.
             self.elsewhere.add(name)
+
+    def read_arguments(self, name: str, node: ast.Call) -> dict:
+        """One call to the library: each argument's name and, where it can be had, its value."""
+        last = name.rsplit(".", 1)[-1]
+        signature = class_signature(self.module, last) if last[:1].isupper() else None
+        given: list[tuple[str, ast.AST]] = []
+        for parameter, arg in zip(signature[0] if signature else (), node.args, strict=False):
+            if isinstance(arg, ast.Starred):
+                break
+            given.append((parameter, arg))
+        given += [(k.arg, k.value) for k in node.keywords if k.arg]
+
+        arguments, followed, star = {}, set(), False
+        for key, value_node in given:
+            arguments[key], was_followed = self.value_of(value_node)
+            if was_followed:
+                followed.add(key)
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                continue
+            entries = self.unpacked(keyword.value)
+            if entries is None:
+                star = True  # arguments this reading cannot see
+                continue
+            for key, value_node in entries[0]:
+                if key in arguments:
+                    continue
+                arguments[key], was_followed = self.value_of(value_node)
+                if arguments[key] != EXPRESSION and (was_followed or entries[1]):
+                    followed.add(key)
+        return {
+            "name": name,
+            "args": len(node.args),
+            "kwargs": arguments,
+            "followed": sorted(followed),
+            "star": star,
+        }
 
 
 def _split_arguments(text: str) -> list[str]:
@@ -283,12 +468,15 @@ def _read_with_regex(text: str, module: str, reader: _Reader) -> bool:
     pattern = rf"^[ \t]*import[ \t]+({module}[\w.]*)(?:[ \t]+as[ \t]+(\w+))?"
     for match in re.finditer(pattern, text, re.MULTILINE):
         heads[match.group(2) or module] = match.group(1) if match.group(2) else module
+        renamed = f" as {module}" if match.group(2) == module and match.group(1) != module else ""
+        reader.import_forms.add(f"import {match.group(1)}{renamed}")
     pattern = rf"^[ \t]*from[ \t]+({module}[\w.]*)[ \t]+import[ \t]+([^\n#]+)"
     for match in re.finditer(pattern, text, re.MULTILINE):
         for part in match.group(2).strip("() \t").split(","):
             words = part.split()
             if words and words[0].isidentifier():
                 heads[words[-1] if "as" in words else words[0]] = f"{match.group(1)}.{words[0]}"
+                reader.import_forms.add(f"from {match.group(1)} import {words[0]}")
     for head, resolved in heads.items():
         call = rf"(?<![\w.]){re.escape(head)}((?:\.\w+)*)[ \t]*\("
         for match in re.finditer(call, text):
@@ -313,7 +501,9 @@ def _read_with_regex(text: str, module: str, reader: _Reader) -> bool:
                 else:
                     n_args += 1
             reader.names.add(name)
-            reader.calls.append({"name": name, "args": n_args, "kwargs": kwargs, "star": star})
+            reader.calls.append(
+                {"name": name, "args": n_args, "kwargs": kwargs, "followed": [], "star": star}
+            )
     return bool(heads)
 
 
@@ -328,7 +518,7 @@ def read_source(text: str, module: str) -> dict:
     for tree in parsed:
         reader.collect_imports(tree)
     for tree in parsed:
-        reader.collect_instances(tree)
+        reader.collect_assignments(tree)
     for tree in parsed:
         reader.collect_uses(tree)
     imports = any(reader.ours(target) for target in reader.aliases.values()) or reader.star
@@ -339,6 +529,9 @@ def read_source(text: str, module: str) -> dict:
     return {
         "imports": imports,
         "star_import": reader.star,
+        "import_forms": sorted(reader.import_forms),
+        "guarded": reader.guarded,
+        "lazy": reader.lazy,
         "names": sorted(reader.names),
         "calls": reader.calls,
         "methods": reader.methods,

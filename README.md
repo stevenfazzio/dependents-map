@@ -29,8 +29,8 @@ all kept on disk, so a re-run only does what is missing.
 | Resolve | `01_resolve_packages.py` | Looks up on PyPI the packages GitHub lists without a repository, for their description and a link to their source |
 | Fetch | `02_fetch_repos.py` | Metadata and README for every repository, through GitHub's GraphQL API |
 | Select | `03_select_corpus.py` | One candidate document per project: drops forks represented by their parent, READMEs under 200 characters and identical copies, and adds packages known only from PyPI |
-| Declare | `04_find_declarations.py` | Reads each repository's dependency files to see where it names the package: in a dependency list the project wrote, only in a dumped environment, only in a lock file, or nowhere |
-| Read code | `05_read_code.py` | Reads every Python file and notebook of every repository to see what the code does with the package: whether it imports it, what it calls and with which arguments |
+| Declare | `04_find_declarations.py` | Reads each repository's dependency files to see where it names the package: in a dependency list the project wrote, only in a dumped environment, only in a lock file, or nowhere, and which versions it asks for |
+| Read code | `05_read_code.py` | Reads every Python file and notebook of every repository to see what the code does with the package: how it imports it, what it calls and with which arguments |
 | Filter | `06_filter_corpus.py` | Leaves off the map the candidates with no sign of the package in their code, in a dependency list they wrote, or in their README |
 | Embed | `07_embed.py` | Qwen3-Embedding-8B, served by vLLM on a RunPod serverless endpoint, embeds each README (cut to 8,000 tokens) |
 | Reduce | `08_reduce.py` | UMAP to the 2-d layout |
@@ -63,11 +63,21 @@ something visible on the map.
   it at all.
 - 3,259 candidates show no sign of UMAP in their code, in a dependency list they wrote or
   in their README, and are left off the map. Of the 7,250 on it, 69% call UMAP directly.
+- Of the 5,031 projects that call UMAP, 883 use something beyond building a model and
+  fitting it: 505 transform new data, 119 call the lower-level functions, 113 pass a
+  precomputed metric, 97 use `umap.plot`, 91 fit with labels, and 33 each use DensMAP and
+  Parametric UMAP. 1,105 set the metric to cosine and to nothing else, against 2,662
+  that leave it at the default. 2,444 set `random_state` in every call and 1,955 in none.
 - The map has 178, 53, 17 and 6 named regions, from the finest layer to the coarsest.
 - About 27% of the projects on the map mention UMAP anywhere in their README. Point size
   and one colormap show GitHub stars; the other colormaps show domain, project type, UMAP
-  use per the README, UMAP in the code, where `umap-learn` is listed, package or
-  repository, and the year of the last push.
+  use per the README, UMAP in the code, the UMAP features used, the distance metric,
+  whether a random seed is set, where `umap-learn` is listed, which versions of it are
+  asked for, package or repository, and the year of the last push.
+- A project can call UMAP many times, and a point has one colour. Each project is coloured
+  by the rarest feature it uses, and by the metric it sets where it sets exactly one. The
+  hovercard shows the call a project makes most often, and search finds every project that
+  uses a feature or sets a value, for example `metric=cosine` or `umap-learn==0.5.3`.
 
 ## Reproducing
 

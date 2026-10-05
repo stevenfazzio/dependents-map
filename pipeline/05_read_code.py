@@ -42,7 +42,7 @@ from typing import NamedTuple
 
 import github
 import pandas as pd
-from code_usage import CELL_BREAK, imported_modules, read_source
+from code_usage import CELL_BREAK, EXPRESSION, imported_modules, read_source
 from config import DATA_DIR, ROOT, Target, get_target
 from storage import write_parquet_safely
 
@@ -304,7 +304,10 @@ def read_repository(target: Target, files: list[tuple[str, str]], sources: dict[
     """What one repository's code does with the module, from the source of its files."""
     module = target.module
     carriers = [(carrier, re.compile(carrier.pattern)) for carrier in target.carriers]
+    signals = [(signal, re.compile(signal.pattern)) for signal in target.signals]
     carried: set[str] = set()
+    signalled: set[str] = set()
+    import_forms: set[str] = set()
     modules: set[str] = set()
     names: set[str] = set()
     called: set[str] = set()
@@ -312,7 +315,8 @@ def read_repository(target: Target, files: list[tuple[str, str]], sources: dict[
     uncertain_methods: set[str] = set()
     attributes: set[str] = set()
     elsewhere: set[str] = set()
-    kwargs: dict[str, set] = {}
+    arguments: dict[str, dict] = {}
+    configurations: dict[str, dict] = {}
     calling_files = []
     counts = Counter()
     # The project's own modules and packages, which are not somebody else's library.
@@ -327,6 +331,7 @@ def read_repository(target: Target, files: list[tuple[str, str]], sources: dict[
         if module not in text.lower():
             continue
         counts["naming"] += 1
+        signalled |= {signal.label for signal, pattern in signals if pattern.search(text)}
         try:
             usage = read_source(text, module)
         except Exception as e:  # one unreadable file must not end a run of a million
@@ -336,6 +341,9 @@ def read_repository(target: Target, files: list[tuple[str, str]], sources: dict[
         counts["unparsed"] += bool(usage["unparsed"])
         counts["imports"] += usage["imports"]
         counts["star_import"] += usage["star_import"]
+        counts["guarded"] += usage["guarded"]
+        counts["lazy"] += usage["lazy"]
+        import_forms |= set(usage["import_forms"])
         names |= {canonical(name) for name in usage["names"]}
         attributes |= {name.rsplit(".", 1)[-1] for name in usage["attributes"]}
         elsewhere |= {name for name in usage["elsewhere"] if name.split(".")[0] not in own}
@@ -345,9 +353,30 @@ def read_repository(target: Target, files: list[tuple[str, str]], sources: dict[
             if name.rsplit(".", 1)[-1][:1].isupper():
                 counts["constructor_calls"] += 1
                 counts["star_kwargs"] += call["star"]
+                # The same arguments in another order are the same configuration; the
+                # order kept is the one first written.
+                same = json.dumps([name, call["kwargs"], call["star"]], sort_keys=True)
+                configuration = configurations.setdefault(
+                    same,
+                    {
+                        "name": name,
+                        "kwargs": call["kwargs"],
+                        "followed": call["followed"],
+                        "star": call["star"],
+                        "n": 0,
+                    },
+                )
+                configuration["n"] += 1
                 for key, value in call["kwargs"].items():
-                    # Kept as JSON so 2, 2.0 and "2" stay apart.
-                    kwargs.setdefault(key, set()).add(json.dumps(value))
+                    entry = arguments.setdefault(
+                        key, {"written": set(), "followed": set(), "unresolved": 0}
+                    )
+                    if value == EXPRESSION:
+                        entry["unresolved"] += 1
+                    else:
+                        # Kept as JSON so 2, 2.0 and "2" stay apart.
+                        how = "followed" if key in call["followed"] else "written"
+                        entry[how].add(json.dumps(value))
         for method in usage["methods"]:
             if method["uncertain"]:
                 uncertain_methods.add(method["method"])
@@ -384,7 +413,26 @@ def read_repository(target: Target, files: list[tuple[str, str]], sources: dict[
         "called": sorted(called),
         "n_constructor_calls": counts["constructor_calls"],
         "star_kwargs": bool(counts["star_kwargs"]),
-        "kwargs": json.dumps({key: sorted(values) for key, values in sorted(kwargs.items())}),
+        # Per constructor argument: the values written at a call, the values followed
+        # through a variable, and how many calls passed something that is neither.
+        "arguments": json.dumps(
+            {
+                key: {
+                    **entry,
+                    "written": sorted(entry["written"]),
+                    "followed": sorted(entry["followed"]),
+                }
+                for key, entry in sorted(arguments.items())
+            }
+        ),
+        # Each distinct constructor call whole, the commonest first, with how many times
+        # the project makes it. The summary above cannot say which values go together,
+        # or whether a call that leaves an argument out sits beside one that sets it.
+        "calls": json.dumps(sorted(configurations.values(), key=lambda c: -c["n"])),
+        "import_forms": sorted(import_forms),
+        "import_guarded": bool(counts["guarded"]),
+        "import_lazy": bool(counts["lazy"]),
+        "signals": sorted(signalled),
         "methods": sorted(methods),
         "uncertain_methods": sorted(uncertain_methods),
         "fits_with_target": bool(counts["fits_with_target"]),
@@ -418,9 +466,10 @@ def build_table(
     table = pd.DataFrame.from_records(rows)
     table["use"] = pd.Categorical(table["use"], USES)
     lists = ("called", "methods", "uncertain_methods", "attributes", "names", "elsewhere")
-    for column in (*lists, "through", "modules", "calling_files"):
+    for column in (*lists, "through", "modules", "calling_files", "import_forms", "signals"):
         table[column] = table[column].map(lambda v: v if isinstance(v, list) else [])
-    for column in ("imports", "star_import", "star_kwargs", "fits_with_target"):
+    flags = ("imports", "star_import", "star_kwargs", "fits_with_target")
+    for column in (*flags, "import_guarded", "import_lazy"):
         table[column] = table[column].astype("boolean")
     for column in [c for c in table.columns if c.startswith("n_")]:
         table[column] = table[column].astype("Int64")
@@ -454,11 +503,32 @@ def report(table: pd.DataFrame, target: Target) -> None:
     print(f"  attributes read: {tally(callers['attributes']).most_common(10)}")
     print(f"  fit with a target: {callers['fits_with_target'].sum()}")
     print(f"  keyword arguments passed through **: {callers['star_kwargs'].sum()}")
-    kwargs = [json.loads(k) for k in callers["kwargs"]]
-    print(f"  constructor arguments: {Counter(key for k in kwargs for key in k).most_common(30)}")
-    for key in ("n_components", "metric", "n_neighbors", "min_dist", "random_state"):
-        values = Counter(value for k in kwargs for value in k.get(key, []))
-        print(f"    {key}: {values.most_common(12)}")
+    distinct = callers["calls"].map(lambda calls: len(json.loads(calls)))
+    print(
+        f"  distinct constructor calls per project: none {(distinct == 0).sum()}, "
+        f"one {(distinct == 1).sum()}, two or three {distinct.between(2, 3).sum()}, "
+        f"more {(distinct > 3).sum()}"
+    )
+    arguments = [json.loads(a) for a in callers["arguments"]]
+    passed = Counter(key for a in arguments for key in a)
+    print(f"  constructor arguments: {passed.most_common(30)}")
+    print("  per argument: projects passing it, with a value written at the call, with one")
+    print("  only by following a variable, with none; then the commonest values")
+    for key, n in passed.most_common(12):
+        entries = [a[key] for a in arguments if key in a]
+        written = sum(bool(e["written"]) for e in entries)
+        followed = sum(bool(e["followed"]) and not e["written"] for e in entries)
+        values = Counter(v for e in entries for v in {*e["written"], *e["followed"]})
+        print(
+            f"    {key}: {n} | {written} | {followed} | {n - written - followed} | "
+            f"{values.most_common(8)}"
+        )
+    print(f"  how they import it: {tally(callers['import_forms']).most_common(12)}")
+    print(
+        f"  import inside a try: {callers['import_guarded'].sum()}; "
+        f"inside a function: {callers['import_lazy'].sum()}"
+    )
+    print(f"  signals: {tally(callers['signals']).most_common()}")
     print(f"\nOther libraries' {target.module}: {tally(read['elsewhere']).most_common(20)}")
     print(f"Through a library that runs it unnamed: {tally(read['through']).most_common()}")
     print(f"Imported alongside, by callers: {tally(callers['modules']).most_common(40)}")

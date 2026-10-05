@@ -17,6 +17,7 @@ import json
 import os
 import re
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 import datamapplot
@@ -24,6 +25,8 @@ import glasbey
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import usage_fields as usage
+from code_usage import EXPRESSION, class_signature
 from config import PUBLIC_BASE_URL, ROOT, Target, get_target
 from matplotlib.colors import to_hex, to_rgb
 from storage import write_bytes_safely
@@ -73,12 +76,46 @@ CUSTOM_CSS = """
 NEUTRAL_COLORS = {
     "Not mentioned": "#d9d9d9",
     "Not found": "#d9d9d9",
+    "Not in a dependency list": "#d9d9d9",
     "Repository": "#d0d0d0",
     "Listed only": "#9a9a9a",
     "No code read": "#9a9a9a",
     "Other": "#8c8c8c",
     "Unknown": "#e2e2e2",
 }
+
+# The colormaps drawn from a project's calls have three non-answers, here palest first:
+# no call to colour, a call that settles for the usual, and a call whose arguments this
+# reading cannot see. A legend entry selects points by their colour, so within one
+# colormap every grey has to be a different one.
+NO_CALL = "No direct call"
+NO_FEATURE = "None of these"
+UNREADABLE = "Not readable"
+SEVERAL = "Several values"
+CALL_NEUTRALS = {NO_CALL: "#e2e2e2", NO_FEATURE: "#c4c4c4", UNREADABLE: "#a8a8a8"}
+DEFAULT_GREY = CALL_NEUTRALS[NO_FEATURE]
+# A value that fewer projects than this give shares "Other" with the rest of the rare ones.
+MIN_VALUE_PROJECTS = 20
+GIVEN_LABELS = {
+    usage.EVERY: "Set in every call",
+    usage.SOME: "Set in some calls",
+    usage.NEVER: "Not set",
+    usage.UNREADABLE: UNREADABLE,
+}
+# A range and a bare ceiling both stop the package at some version.
+VERSION_LABELS = {
+    "Any version": "Any version",
+    "Lower bound": "Lower bound",
+    "One version": "One exact version",
+    "Compatible releases": "Compatible releases",
+    "Bounded range": "Has an upper bound",
+    "Upper bound": "Has an upper bound",
+}
+# What a card shows of one call.
+MAX_SHOWN_ARGUMENTS = 6
+# How a version specifier begins, as against "" for any version and "from source".
+SPEC_STARTS = ("=", "<", ">", "~", "^", "!")
+MAX_SHOWN_VALUE = 24
 
 # glasbey measures distance as a colour-blind viewer sees it, and for the third category of
 # "where the package is listed" it chose a magenta that normal vision barely separates
@@ -91,13 +128,20 @@ LISTED_IN_OVERRIDES = {"Lock file only": "#51d400"}
 # Cards are read in quick succession while sweeping the mouse, so every card has the
 # same layout: domain pill, name, labelled fields, then the summary and a footer. The
 # fields sit above the summary because summaries vary in length; below it they would
-# land at a different height on every card.
+# land at a different height on every card. "In code" is the last field for the same
+# reason: it runs from one line to four.
 DOT = (
     "display: inline-block; width: 8px; height: 8px; border-radius: 50%; "
     "margin-right: 6px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.15); "
     "background: {color};"
 )
 FIELD_NAME = "color: #6b7280; font-size: 11px; padding-top: 1px;"
+CODE = (
+    "font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; "
+    "font-size: 11px; overflow-wrap: anywhere;"
+)
+# Under a row's value and in line with its text, past the dot.
+NOTE = "color: #6b7280; font-size: 11px; margin-left: 14px;"
 HOVER_TEMPLATE = f"""
 <div style="max-width: 340px; white-space: normal; font-weight: 400; color: #1f2328;">
   <span style="display: inline-block; padding: 1px 8px; margin-bottom: 5px;
@@ -111,10 +155,10 @@ HOVER_TEMPLATE = f"""
     <div><span style="{DOT.format(color="{type_dot}")}"></span>{{project_type}}</div>
     <div style="{FIELD_NAME}">UMAP use</div>
     <div><span style="{DOT.format(color="{role_dot}")}"></span>{{umap_role}}</div>
-    <div style="{FIELD_NAME}">In code</div>
-    <div><span style="{DOT.format(color="{code_dot}")}"></span>{{in_code}}</div>
     <div style="{FIELD_NAME}">Listed in</div>
     <div><span style="{DOT.format(color="{listed_dot}")}"></span>{{listed_in}}</div>
+    <div style="{FIELD_NAME}">In code</div>
+    <div><span style="{DOT.format(color="{code_dot}")}"></span>{{in_code}}</div>
   </div>
   <div style="font-size: 13px; margin-top: 8px; padding-top: 7px;
     border-top: 1px solid #e5e7eb; line-height: 1.4;">{{summary}}</div>
@@ -136,34 +180,49 @@ def categorical_palette(n_colors: int, avoid: list[str]) -> list[str]:
         # colour when drawn as small dots.
         lightness_bounds=(35, 75),
         chroma_bounds=(20, 90),
+        # Left unset, glasbey takes the hue range from a palette of four or more colours,
+        # and the range of four greys holds no colours at all.
+        hue_bounds=(0, 360),
     )
     return palette[len(avoid) :]
 
 
-def color_mapping(values: pd.Series, overrides: dict[str, str] | None = None) -> dict[str, str]:
+def color_mapping(
+    values: pd.Series,
+    overrides: dict[str, str] | None = None,
+    neutrals: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Category -> colour, most frequent first.
 
     glasbey's palette is greedy, so its earliest colours are the most distinct; handing
     them out by frequency gives the largest categories the clearest colours. `overrides`
-    replaces the colour glasbey chose for a category.
+    replaces the colour glasbey chose for a category, and `neutrals` names this colormap's
+    own greys, beside the ones every colormap shares.
     """
+    greys = NEUTRAL_COLORS | (neutrals or {})
     order = values.value_counts().index.tolist()
-    named = [c for c in order if c not in NEUTRAL_COLORS]
-    neutrals = {c: NEUTRAL_COLORS[c] for c in order if c in NEUTRAL_COLORS}
-    palette = categorical_palette(len(named), list(neutrals.values()))
+    named = [c for c in order if c not in greys]
+    used = {c: greys[c] for c in order if c in greys}
+    palette = categorical_palette(len(named), list(used.values()))
     mapping = dict(zip(named, palette, strict=True))
     mapping.update({c: color for c, color in (overrides or {}).items() if c in mapping})
-    mapping.update(neutrals)
+    mapping.update(used)
+    # Clicking a legend entry selects the points drawn in its colour.
+    assert len(set(mapping.values())) == len(mapping), f"two categories share a colour: {mapping}"
     return mapping
 
 
 def categorical_colormap(
-    field: str, description: str, values: pd.Series, overrides: dict[str, str] | None = None
+    field: str,
+    description: str,
+    values: pd.Series,
+    overrides: dict[str, str] | None = None,
+    neutrals: dict[str, str] | None = None,
 ):
     # An explicit "Unknown" rather than dropped points, so a gap in the metadata doesn't
     # read as a hole in the map.
     values = values.fillna("Unknown").astype(str)
-    mapping = color_mapping(values, overrides)
+    mapping = color_mapping(values, overrides, neutrals)
     meta = {
         "field": field,
         "description": description,
@@ -223,10 +282,11 @@ def declaration_category(df: pd.DataFrame) -> pd.Series:
 
 
 def declaration_detail(row, category: str) -> str:
-    """The category with the specifics a card has room for: which file, or what pulled it in."""
+    """The category with the specifics a card has room for, as HTML: which file and which
+    versions, or what pulled the package in."""
     if category == "Lock file only" and len(row.via):
         more = f" +{len(row.via) - 2}" if len(row.via) > 2 else ""
-        return f"{category}, via {', '.join(row.via[:2])}{more}"
+        return html.escape(f"{category}, via {', '.join(row.via[:2])}{more}")
     if category in ("Dependency list", "Environment dump"):
         if row.declaration_basis == "PyPI metadata":
             where = "PyPI metadata"
@@ -235,8 +295,31 @@ def declaration_detail(row, category: str) -> str:
             paths = sorted(row.declared_in, key=lambda p: (p.endswith(".lock"), p.count("/"), p))
             where = paths[0].rsplit("/", 1)[-1]
         scope = {"optional": ", optional", "dev": ", development"}.get(row.scope, "")
-        return f"{category} ({where}{scope})"
-    return category
+        detail = html.escape(f"{category} ({where}{scope})")
+        # The specifier alone: the row is about one package, and the card is narrow.
+        spec = row.version_spec
+        if spec == "":
+            return f"{detail}, any version"
+        if spec == "from source":
+            return f"{detail}, from source"
+        if isinstance(spec, str):
+            return f'{detail} <code style="{CODE}">{html.escape(spec)}</code>'
+        return detail
+    return html.escape(category)
+
+
+def version_category(df: pd.DataFrame, listed: pd.Series) -> pd.Series:
+    """Which versions each project asks for, where it wrote the package into a list."""
+    asked = df["version_kind"].astype(object).map(VERSION_LABELS)
+    # From source, or a specifier stage 04 could not read.
+    asked = asked.where(asked.notna(), "Other")
+    category = np.select(
+        # A dumped environment records the version that was installed, which nobody chose.
+        [listed == "Dependency list", listed == "Environment dump"],
+        [asked, "Environment dump"],
+        default="Not in a dependency list",
+    )
+    return pd.Series(category, index=df.index)
 
 
 def code_category(df: pd.DataFrame, name: str) -> pd.Series:
@@ -256,19 +339,84 @@ def code_category(df: pd.DataFrame, name: str) -> pd.Series:
     return category
 
 
-def code_detail(row, category: str) -> str:
-    """The category with what a card has room to add."""
+def call_text(call: dict) -> str:
+    """One constructor call as its author might have written it, cut to fit a card."""
+
+    def shown(value) -> str:
+        if value == EXPRESSION:
+            return "…"
+        text = repr(value)
+        return text if len(text) <= MAX_SHOWN_VALUE else text[: MAX_SHOWN_VALUE - 1] + "…"
+
+    parts = [f"{key}={shown(value)}" for key, value in call["kwargs"].items()]
+    if call["star"]:
+        parts.append("**…")
+    if len(parts) > MAX_SHOWN_ARGUMENTS:
+        parts = [*parts[:MAX_SHOWN_ARGUMENTS], f"+{len(parts) - MAX_SHOWN_ARGUMENTS} more"]
+    return f"{call['name'].rsplit('.', 1)[-1]}({', '.join(parts)})"
+
+
+def code_detail(row, category: str, calls: list[dict], features: list[str]) -> str:
+    """The category with what a card has room to add, as HTML."""
     if row.code_use == "Another library's":
         # The function that computes a layout, before the one that plots it; or, for a
         # project that never names the library, the one that runs it for the project.
         names = [*row.elsewhere] or [*row.through]
         shown = min(names, key=lambda name: (".pl." in name, name))
-        return f"{category} ({shown})"
+        return html.escape(f"{category} ({shown})")
     if row.code_use == "Imports it, calls nothing":
-        return f"{category} (imported, never called)"
+        return html.escape(f"{category} (imported, never called)")
     if row.code_use == "Names it only":
-        return f"{category} (in names, strings or comments)"
-    return category
+        return html.escape(f"{category} (in names, strings or comments)")
+    if row.code_use != "Calls it":
+        return html.escape(category)
+    notes = []
+    if calls:
+        # The call it makes most often says more than the category would, and holds the
+        # arguments that have no colormap of their own.
+        shown = f'<code style="{CODE}">{html.escape(call_text(calls[0]))}</code>'
+        if len(calls) > 1:
+            others = len(calls) - 1
+            notes.append(f"+{others} other configuration{'s' if others > 1 else ''}")
+    else:
+        # Functions only, or methods of an object this reading never saw built.
+        shown = html.escape(f"{category} ({row.called[0]})" if len(row.called) else category)
+    if features:
+        notes.append("Features: " + ", ".join(features))
+    return shown + "".join(f'<div style="{NOTE}">{html.escape(note)}</div>' for note in notes)
+
+
+def call_categories(
+    target: Target, calls: list[list[dict]], calls_it: np.ndarray, parameter: str
+) -> tuple[pd.Series, dict[str, str]]:
+    """Each project by the value its calls give one argument, and this colormap's greys."""
+    answers = [
+        usage.value_given(project, parameter) if direct else None
+        for project, direct in zip(calls, calls_it, strict=True)
+    ]
+    # The default of the class the projects build most, read from the installed library.
+    classes = Counter(call["name"].rsplit(".", 1)[-1] for project in calls for call in project)
+    signature = class_signature(target.module, classes.most_common(1)[0][0]) if classes else None
+    default = signature[1].get(parameter) if signature else None
+    default_label = "Default" if default is None else f"Default ({default})"
+    given = Counter(json.dumps(a[1]) for a in answers if a is not None and a[0] == usage.VALUE)
+
+    def label(answer) -> str:
+        if answer is None:
+            return NO_CALL
+        kind, value = answer
+        if kind == usage.SEVERAL:
+            return SEVERAL
+        if kind == usage.DEFAULT:
+            return default_label
+        if kind == usage.UNREADABLE:
+            return UNREADABLE
+        if given[json.dumps(value)] < MIN_VALUE_PROJECTS:
+            return "Other"
+        # Beside "Default (euclidean)", a bare "euclidean" would look like the same thing.
+        return f"{value}, written out" if value == default else str(value)
+
+    return pd.Series([label(a) for a in answers]), CALL_NEUTRALS | {default_label: DEFAULT_GREY}
 
 
 def footer(row) -> str:
@@ -378,13 +526,37 @@ def load(target: Target) -> pd.DataFrame:
     df = df.merge(enrichment, on="doc_id", how="left", validate="one_to_one")
     declarations = pd.read_parquet(
         target.declarations_parquet,
-        columns=["doc_id", "status", "basis", "dumped", "declared_in", "via", "scope"],
+        columns=[
+            "doc_id",
+            "status",
+            "basis",
+            "dumped",
+            "declared_in",
+            "via",
+            "scope",
+            "version_spec",
+            "version_kind",
+        ],
     ).rename(columns={"status": "declaration_status", "basis": "declaration_basis"})
     df = df.merge(declarations, on="doc_id", how="left", validate="one_to_one")
     code = pd.read_parquet(
-        target.code_usage_parquet, columns=["doc_id", "use", "called", "elsewhere", "through"]
+        target.code_usage_parquet,
+        columns=[
+            "doc_id",
+            "use",
+            "called",
+            "elsewhere",
+            "through",
+            "methods",
+            "fits_with_target",
+            "calls",
+            "import_forms",
+            "signals",
+        ],
     ).rename(columns={"use": "code_use"})
     df = df.merge(code, on="doc_id", how="left", validate="one_to_one")
+    # A project whose code was not read has no answer here, which is not a yes.
+    df["fits_with_target"] = df["fits_with_target"].astype("boolean").fillna(False).astype(bool)
     assert len(df) == len(documents), "merge changed the row count"
     assert df["declaration_status"].notna().all(), "documents stage 04 has not read"
     assert df["code_use"].notna().all(), "documents stage 05 has not read"
@@ -429,6 +601,53 @@ def main() -> None:
         declaration_category(df),
         LISTED_IN_OVERRIDES,
     )
+    version_values, version_meta, _ = categorical_colormap(
+        "version_asked",
+        f"{target.package} version asked for",
+        version_category(df, pd.Series(listed_values, index=df.index)),
+    )
+
+    # How the code calls the library, for the projects whose code calls it at all.
+    calls_it = (df["code_use"] == "Calls it").to_numpy()
+    calls = [usage.constructor_calls(project) for project in df["calls"]]
+    features = [
+        usage.features_used(
+            target.features, list(row.called), list(row.methods), bool(row.fits_with_target), c
+        )
+        if direct
+        else []
+        for row, c, direct in zip(df.itertuples(), calls, calls_it, strict=True)
+    ]
+    # One feature a project, the rarest it uses; the card and the search text have them all.
+    shown_feature = [
+        (feature or NO_FEATURE) if direct else NO_CALL
+        for feature, direct in zip(
+            usage.rarest_feature(features, target.features), calls_it, strict=True
+        )
+    ]
+    call_values, call_metas = [], []
+    values, meta, _ = categorical_colormap(
+        "features", f"{target.name} features used", pd.Series(shown_feature), neutrals=CALL_NEUTRALS
+    )
+    call_values.append(values)
+    call_metas.append(meta)
+    for parameter, description in target.value_colormaps:
+        category, greys = call_categories(target, calls, calls_it, parameter)
+        values, meta, _ = categorical_colormap(parameter, description, category, neutrals=greys)
+        call_values.append(values)
+        call_metas.append(meta)
+    for parameter, description in target.given_colormaps:
+        category = pd.Series(
+            [
+                GIVEN_LABELS[usage.how_often_given(project, parameter)] if direct else NO_CALL
+                for project, direct in zip(calls, calls_it, strict=True)
+            ]
+        )
+        values, meta, _ = categorical_colormap(
+            f"{parameter}_given", description, category, neutrals=CALL_NEUTRALS
+        )
+        call_values.append(values)
+        call_metas.append(meta)
     kind_values, kind_meta, _ = categorical_colormap(
         "listed_as",
         "Package or repository",
@@ -450,12 +669,14 @@ def main() -> None:
             "umap_role": pd.Series(role_values).map(html.escape),
             "role_dot": [role_colors[v] for v in role_values],
             "in_code": [
-                html.escape(code_detail(row, category))
-                for row, category in zip(df.itertuples(), code_values, strict=True)
+                code_detail(row, category, c, f)
+                for row, category, c, f in zip(
+                    df.itertuples(), code_values, calls, features, strict=True
+                )
             ],
             "code_dot": [code_colors[v] for v in code_values],
             "listed_in": [
-                html.escape(declaration_detail(row, category))
+                declaration_detail(row, category)
                 for row, category in zip(df.itertuples(), listed_values, strict=True)
             ],
             "listed_dot": [listed_colors[v] for v in listed_values],
@@ -478,10 +699,18 @@ def main() -> None:
                         # What the code calls, by its dotted name, so that searching for a
                         # class or function finds the projects that use it.
                         " ".join([*row.called, *row.elsewhere, *row.through]),
+                        # Every feature and every argument value, which the colormaps
+                        # show one of: "metric=cosine" finds each project that sets it.
+                        " ".join([*used, *usage.argument_tokens(c)]),
+                        " ".join([*row.import_forms, *row.signals]),
+                        # The requirement as pip would write it: "umap-learn>=0.5".
+                        f"{target.package}{row.version_spec}"
+                        if isinstance(row.version_spec, str) and row.version_spec[:1] in SPEC_STARTS
+                        else "",
                     ]
                 )
-                for row, text, domain, kind in zip(
-                    df.itertuples(), summary, domain_label, type_label, strict=True
+                for row, text, domain, kind, used, c in zip(
+                    df.itertuples(), summary, domain_label, type_label, features, calls, strict=True
                 )
             ],
         }
@@ -526,7 +755,9 @@ def main() -> None:
             type_values,
             role_values,
             code_values,
+            *call_values,
             listed_values,
+            version_values,
             kind_values,
             # DataMapPlot spaces five legend ticks evenly over the range, so capping at
             # 10,000 stars puts them on whole powers of ten. On umap-learn, 25 projects
@@ -539,7 +770,9 @@ def main() -> None:
             type_meta,
             role_meta,
             code_meta,
+            *call_metas,
             listed_meta,
+            version_meta,
             kind_meta,
             {
                 "field": "stars",
