@@ -81,6 +81,13 @@ class Target:
     def enrichment_parquet(self) -> Path:
         return self.data_dir / "enrichment.parquet"
 
+    def declaration_log(self, fetch_pass: str) -> Path:
+        return self.data_dir / f"declaration_{fetch_pass}.batches.jsonl"
+
+    @property
+    def declarations_parquet(self) -> Path:
+        return self.data_dir / "declarations.parquet"
+
     @property
     def labels_parquet(self) -> Path:
         return self.data_dir / "labels.parquet"

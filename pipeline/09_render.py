@@ -5,7 +5,7 @@ the generated one-sentence summary and the categories. README text stays out of 
 page; it is in the embeddings, not the HTML.
 
 Usage:
-    uv run python pipeline/08_render.py umap-learn
+    uv run python pipeline/09_render.py umap-learn
     uv run python pipeline/build_index.py    # refresh the page that lists the maps
 """
 
@@ -62,11 +62,20 @@ CUSTOM_CSS = """
 # where the exceptions are.
 NEUTRAL_COLORS = {
     "Not mentioned": "#d9d9d9",
+    "Not found": "#d9d9d9",
     "Repository": "#d0d0d0",
     "Listed only": "#9a9a9a",
     "Other": "#8c8c8c",
     "Unknown": "#e2e2e2",
 }
+
+# glasbey measures distance as a colour-blind viewer sees it, and for the third category of
+# "where the package is listed" it chose a magenta that normal vision barely separates
+# from the red beside it (33 in CAM02-UCS, where every other pair is over 50). This green
+# is the colour farthest from the other three at worst over normal, deuteranomalous and
+# protanomalous vision. It is much lighter than the red, which is what keeps the two
+# apart for a colour-blind viewer.
+LISTED_IN_OVERRIDES = {"Lock file only": "#51d400"}
 
 # Cards are read in quick succession while sweeping the mouse, so every card has the
 # same layout: domain pill, name, labelled fields, then the summary and a footer. The
@@ -91,6 +100,8 @@ HOVER_TEMPLATE = f"""
     <div><span style="{DOT.format(color="{type_dot}")}"></span>{{project_type}}</div>
     <div style="{FIELD_NAME}">UMAP use</div>
     <div><span style="{DOT.format(color="{role_dot}")}"></span>{{umap_role}}</div>
+    <div style="{FIELD_NAME}">Listed in</div>
+    <div><span style="{DOT.format(color="{listed_dot}")}"></span>{{listed_in}}</div>
   </div>
   <div style="font-size: 13px; margin-top: 8px; padding-top: 7px;
     border-top: 1px solid #e5e7eb; line-height: 1.4;">{{summary}}</div>
@@ -116,26 +127,30 @@ def categorical_palette(n_colors: int, avoid: list[str]) -> list[str]:
     return palette[len(avoid) :]
 
 
-def color_mapping(values: pd.Series) -> dict[str, str]:
+def color_mapping(values: pd.Series, overrides: dict[str, str] | None = None) -> dict[str, str]:
     """Category -> colour, most frequent first.
 
     glasbey's palette is greedy, so its earliest colours are the most distinct; handing
-    them out by frequency gives the largest categories the clearest colours.
+    them out by frequency gives the largest categories the clearest colours. `overrides`
+    replaces the colour glasbey chose for a category.
     """
     order = values.value_counts().index.tolist()
     named = [c for c in order if c not in NEUTRAL_COLORS]
     neutrals = {c: NEUTRAL_COLORS[c] for c in order if c in NEUTRAL_COLORS}
     palette = categorical_palette(len(named), list(neutrals.values()))
     mapping = dict(zip(named, palette, strict=True))
+    mapping.update({c: color for c, color in (overrides or {}).items() if c in mapping})
     mapping.update(neutrals)
     return mapping
 
 
-def categorical_colormap(field: str, description: str, values: pd.Series):
+def categorical_colormap(
+    field: str, description: str, values: pd.Series, overrides: dict[str, str] | None = None
+):
     # An explicit "Unknown" rather than dropped points, so a gap in the metadata doesn't
     # read as a hole in the map.
     values = values.fillna("Unknown").astype(str)
-    mapping = color_mapping(values)
+    mapping = color_mapping(values, overrides)
     meta = {
         "field": field,
         "description": description,
@@ -177,6 +192,40 @@ def shown_label(values: pd.Series, others: pd.Series) -> pd.Series:
     return shown.fillna("Unknown")
 
 
+def declaration_category(df: pd.DataFrame) -> pd.Series:
+    """Where each project names the target package, from stage 07's reading of its files."""
+    declared = df["declaration_status"] == "declared"
+    dumped = df["dumped"].fillna(False).astype(bool)
+    category = np.select(
+        [
+            declared & ~dumped,
+            declared & dumped,
+            df["declaration_status"] == "lock only",
+            df["declaration_status"] == "not found",
+        ],
+        ["Dependency list", "Environment dump", "Lock file only", "Not found"],
+        default="Unknown",
+    )
+    return pd.Series(category, index=df.index)
+
+
+def declaration_detail(row, category: str) -> str:
+    """The category with the specifics a card has room for: which file, or what pulled it in."""
+    if category == "Lock file only" and len(row.via):
+        more = f" +{len(row.via) - 2}" if len(row.via) > 2 else ""
+        return f"{category}, via {', '.join(row.via[:2])}{more}"
+    if category in ("Dependency list", "Environment dump"):
+        if row.declaration_basis == "PyPI metadata":
+            where = "PyPI metadata"
+        else:
+            # The shallowest file that names it, and a list the project wrote before a lock.
+            paths = sorted(row.declared_in, key=lambda p: (p.endswith(".lock"), p.count("/"), p))
+            where = paths[0].rsplit("/", 1)[-1]
+        scope = {"optional": ", optional", "dev": ", development"}.get(row.scope, "")
+        return f"{category} ({where}{scope})"
+    return category
+
+
 def footer(row) -> str:
     parts = []
     if pd.notna(row.stars):
@@ -205,8 +254,8 @@ def open_graph_tags(target: Target, n_documents: int) -> str:
     og = {
         "og:title": target.title,
         "og:description": (
-            f"{n_documents:,} open-source projects that depend on {target.package}, laid "
-            "out by what their READMEs say and named at four zoom levels. "
+            f"{n_documents:,} open-source projects that GitHub lists as depending on "
+            f"{target.package}, laid out by what their READMEs say and named at four zoom levels. "
             "Pan, zoom, hover and search."
         ),
         "og:type": "website",
@@ -230,7 +279,13 @@ def load(target: Target) -> pd.DataFrame:
     labels = pd.read_parquet(target.labels_parquet)
     df = documents.merge(labels, on="doc_id", how="left", validate="one_to_one")
     df = df.merge(enrichment, on="doc_id", how="left", validate="one_to_one")
+    declarations = pd.read_parquet(
+        target.declarations_parquet,
+        columns=["doc_id", "status", "basis", "dumped", "declared_in", "via", "scope"],
+    ).rename(columns={"status": "declaration_status", "basis": "declaration_basis"})
+    df = df.merge(declarations, on="doc_id", how="left", validate="one_to_one")
     assert len(df) == len(documents), "merge changed the row count"
+    assert df["declaration_status"].notna().all(), "documents stage 07 has not read"
     assert df["x"].notna().all(), "documents without coordinates"
     print(f"{len(df)} documents; {df['summary'].isna().sum()} without a summary")
     return df
@@ -261,6 +316,12 @@ def main() -> None:
     role_values, role_meta, role_colors = categorical_colormap(
         "umap_role", "UMAP use (per README)", df["umap_role"]
     )
+    listed_values, listed_meta, listed_colors = categorical_colormap(
+        "listed_in",
+        f"Where {target.package} is listed",
+        declaration_category(df),
+        LISTED_IN_OVERRIDES,
+    )
     kind_values, kind_meta, _ = categorical_colormap(
         "listed_as",
         "Package or repository",
@@ -281,6 +342,11 @@ def main() -> None:
             "type_dot": [type_colors[v] for v in type_values],
             "umap_role": pd.Series(role_values).map(html.escape),
             "role_dot": [role_colors[v] for v in role_values],
+            "listed_in": [
+                html.escape(declaration_detail(row, category))
+                for row, category in zip(df.itertuples(), listed_values, strict=True)
+            ],
+            "listed_dot": [listed_colors[v] for v in listed_values],
             "footer": [html.escape(footer(row)) for row in df.itertuples()],
             "url": df["url"],
             # Search the composed text, not just names: the summary and the categories
@@ -294,6 +360,9 @@ def main() -> None:
                         domain,
                         kind,
                         " ".join(row.topics) if row.topics is not None else "",
+                        # What a lock file says pulled the package in, so searching for
+                        # that library finds the projects it carries.
+                        " ".join(row.via) if row.declaration_status == "lock only" else "",
                     ]
                 )
                 for row, text, domain, kind in zip(
@@ -341,6 +410,7 @@ def main() -> None:
             domain_values,
             type_values,
             role_values,
+            listed_values,
             kind_values,
             # DataMapPlot spaces five legend ticks evenly over the range, so capping at
             # 10,000 stars puts them on whole powers of ten. On umap-learn, 25 projects
@@ -352,6 +422,7 @@ def main() -> None:
             domain_meta,
             type_meta,
             role_meta,
+            listed_meta,
             kind_meta,
             {
                 "field": "stars",
@@ -372,13 +443,15 @@ def main() -> None:
         cvd_safer=True,
         title=target.title,
         sub_title=(
-            f"{len(df):,} dependents of {target.package}, mapped by README."
+            # "GitHub lists": its dependency graph counts lock files and dumped
+            # environments, so some of these projects never asked for the package.
+            f"{len(df):,} projects GitHub lists as depending on {target.package}."
             # DataMapPlot inserts the subtitle as HTML, so the break is explicit: two
             # short lines keep the panel narrower than one long wrapped one.
             "<br />"
             # Nothing else on the page explains point size, or says clicking works:
             # DataMapPlot has no size legend and deck.gl shows a grab cursor on points.
-            "Point size shows GitHub stars. Click to open."
+            "Mapped by README. Point size shows GitHub stars. Click to open."
         ),
         # The defaults (36/18) make the title panel cover the top of the map on
         # laptop-width screens.

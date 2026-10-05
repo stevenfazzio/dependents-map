@@ -5,8 +5,8 @@ link previews what the reader will get. The map is WebGL, so this drives the ins
 Chrome through Playwright; no bundled browser is downloaded.
 
 Usage:
-    uv run python pipeline/09_social_preview.py umap-learn
-    uv run python pipeline/09_social_preview.py umap-learn --zoom 2 --out /tmp/try.png
+    uv run python pipeline/10_social_preview.py umap-learn
+    uv run python pipeline/10_social_preview.py umap-learn --zoom 2 --out /tmp/try.png
 """
 
 import argparse

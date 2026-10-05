@@ -31,9 +31,10 @@ all kept on disk, so a re-run only does what is missing.
 | Embed | `04_embed.py` | Qwen3-Embedding-8B, served by vLLM on a RunPod serverless endpoint, embeds each README (cut to 8,000 tokens) |
 | Reduce | `05_reduce.py` | UMAP to the 2-d layout |
 | Enrich | `06_enrich.py` | Claude Haiku 4.5 (Message Batches API) writes a one-sentence summary and labels project type, domain, and what the README says UMAP is used for |
-| Label | `07_label.py` | [Toponymy](https://github.com/TutteInstitute/toponymy) finds regions on the layout and names them with Claude Opus 5.5, from the summaries |
-| Render | `08_render.py` | [DataMapPlot](https://github.com/TutteInstitute/datamapplot) builds `docs/<target>/index.html` and the data files beside it |
-| Card | `09_social_preview.py` | Screenshots the rendered map in Chrome for the link-preview image |
+| Declare | `07_find_declarations.py` | Reads each repository's dependency files to see where it names the package: in a dependency list the project wrote, only in a dumped environment, only in a lock file, or nowhere |
+| Label | `08_label.py` | [Toponymy](https://github.com/TutteInstitute/toponymy) finds regions on the layout and names them with Claude Opus 5.5, from the summaries |
+| Render | `09_render.py` | [DataMapPlot](https://github.com/TutteInstitute/datamapplot) builds `docs/<target>/index.html` and the data files beside it |
+| Card | `10_social_preview.py` | Screenshots the rendered map in Chrome for the link-preview image |
 
 Regions are found on the same 2-d layout that is plotted, so every named region matches
 something visible on the map.
@@ -47,20 +48,25 @@ something visible on the map.
 - 14,333 repositories were looked up and 14,251 found. After the selection rules,
   10,286 remain, plus 223 packages known only from their PyPI description.
 - The map has 245, 73, 22 and 6 named regions, from the finest layer to the coarsest.
+- GitHub lists a project when any dependency file in it names the package, lock files
+  included, so being listed does not mean a project asked for UMAP. Of the repositories,
+  51% name `umap-learn` in a dependency list they wrote, 34% only in a dumped environment
+  (a `pip freeze` or conda export that also lists UMAP's own dependencies), 5.5% only in
+  a lock file, where another package pulled it in, and for 9% no dependency file names it.
 - About 19% of the projects mention UMAP anywhere in what was read. Point size and one
   colormap show GitHub stars; the other colormaps show domain, project type, UMAP use,
-  package or repository, and the year of the last push.
+  where `umap-learn` is listed, package or repository, and the year of the last push.
 
 ## Reproducing
 
 Requires [uv](https://docs.astral.sh/uv/) and:
 
-- a GitHub login for `gh` (or `GITHUB_TOKEN`), for stage 02;
-- `RUNPOD_API_KEY` and an endpoint serving Qwen3-Embedding-8B, for stages 04 and 07. The
+- a GitHub login for `gh` (or `GITHUB_TOKEN`), for stages 02 and 07;
+- `RUNPOD_API_KEY` and an endpoint serving Qwen3-Embedding-8B, for stages 04 and 08. The
   endpoint's configuration is at the top of `pipeline/embedder.py`, and its ID is set
   there. The one that built this map has been deleted;
-- `ANTHROPIC_API_KEY`, for stages 06 and 07;
-- a local Chrome, for stage 09.
+- `ANTHROPIC_API_KEY`, for stages 06 and 08;
+- a local Chrome, for stage 10.
 
 ```bash
 uv run python pipeline/00_scrape_dependents.py umap-learn    # about an hour: GitHub throttles these pages
@@ -72,11 +78,12 @@ uv run python pipeline/04_embed.py umap-learn                # about 40 minutes 
 uv run python pipeline/05_reduce.py umap-learn
 uv run python pipeline/06_enrich.py umap-learn --pilot 60    # read the outputs before the batch
 uv run python pipeline/06_enrich.py umap-learn
-uv run python pipeline/07_label.py umap-learn --explore      # region counts at a few settings
-uv run python pipeline/07_label.py umap-learn --dry-run      # cost estimate
-uv run python pipeline/07_label.py umap-learn
-uv run python pipeline/08_render.py umap-learn
-uv run python pipeline/09_social_preview.py umap-learn
+uv run python pipeline/07_find_declarations.py umap-learn    # about 10 minutes
+uv run python pipeline/08_label.py umap-learn --explore      # region counts at a few settings
+uv run python pipeline/08_label.py umap-learn --dry-run      # cost estimate
+uv run python pipeline/08_label.py umap-learn
+uv run python pipeline/09_render.py umap-learn
+uv run python pipeline/10_social_preview.py umap-learn
 uv run python pipeline/build_index.py                        # the page that lists the maps
 ```
 
@@ -103,9 +110,10 @@ a title. Then run the stages with the new target's slug. Its data goes to
 `data/<slug>/` and its map to `docs/<slug>/`, and `build_index.py` adds it to the list
 at `docs/index.html`.
 
-Two things are still specific to umap-learn and would need generalising: the enrichment
-prompt in `06_enrich.py` (it describes UMAP and asks what UMAP is used for) and the PyPI
-lookup in stage 01, which assumes a Python package.
+Three things are still specific to umap-learn and would need generalising: the enrichment
+prompt in `06_enrich.py` (it describes UMAP and asks what UMAP is used for), the PyPI
+lookup in stage 01, which assumes a Python package, and stage 07, which reads Python's
+dependency files.
 
 ## License
 

@@ -122,7 +122,7 @@ def main() -> None:
         if target.map_meta_json.exists()
     }
     if not published:
-        raise SystemExit("No rendered maps found under docs/. Run pipeline/08_render.py first.")
+        raise SystemExit("No rendered maps found under docs/. Run pipeline/09_render.py first.")
 
     page = PAGE.format(
         title=TITLE,
