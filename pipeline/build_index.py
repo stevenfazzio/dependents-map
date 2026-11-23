@@ -11,7 +11,7 @@ import html
 import json
 from datetime import datetime
 
-from config import DOCS_DIR, PUBLIC_BASE_URL, REPO_URL, ROOT, TARGETS
+from config import DOCS_DIR, PLAUSIBLE_SNIPPET, PUBLIC_BASE_URL, REPO_URL, ROOT, TARGETS
 from storage import write_bytes_safely
 
 TITLE = "Dependents Maps"
@@ -131,6 +131,8 @@ def main() -> None:
         entries="\n".join(entry(slug, meta) for slug, meta in published.items()),
         repo_url=REPO_URL,
     )
+    # After formatting: the snippet's braces would read as format fields.
+    page = page.replace("</head>", PLAUSIBLE_SNIPPET + "\n</head>", 1)
     write_bytes_safely(DOCS_DIR / "index.html", page.encode())
     # GitHub Pages runs Jekyll over the site unless told not to; these are plain files.
     (DOCS_DIR / ".nojekyll").touch()

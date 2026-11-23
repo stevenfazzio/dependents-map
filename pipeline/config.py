@@ -13,6 +13,14 @@ DOCS_DIR = ROOT / "docs"  # served by GitHub Pages
 # Where docs/ is published; each target's map lives at <base><slug>/.
 PUBLIC_BASE_URL = "https://stevenfazzio.com/dependents-map/"
 REPO_URL = "https://github.com/stevenfazzio/dependents-map"
+# Plausible analytics: the one site that covers all of stevenfazzio.com. The script
+# ignores localhost and file:// pages, so local previews stay out of the stats.
+PLAUSIBLE_SNIPPET = """<!-- Privacy-friendly analytics by Plausible -->
+<script async src="https://plausible.io/js/pa-dvmKWiL1gpqH63wOvMp-g.js"></script>
+<script>
+  window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
+  plausible.init()
+</script>"""
 
 
 @dataclass(frozen=True)

@@ -29,7 +29,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 import usage_fields as usage
 from code_usage import EXPRESSION, class_signature
-from config import PUBLIC_BASE_URL, ROOT, Target, get_target
+from config import PLAUSIBLE_SNIPPET, PUBLIC_BASE_URL, ROOT, Target, get_target
 from matplotlib.colors import to_hex, to_rgb
 from storage import write_bytes_safely
 
@@ -928,7 +928,8 @@ def main() -> None:
         anchor = re.search(r"<meta[^>]*charset[^>]*>", text) or re.search("<head>", text)
         assert anchor is not None, "no <head> in the rendered page"
         at = anchor.end()
-        text = text[:at] + "\n" + open_graph_tags(target, len(df)) + text[at:]
+        head = open_graph_tags(target, len(df)) + "\n" + PLAUSIBLE_SNIPPET
+        text = text[:at] + "\n" + head + text[at:]
         # Pills go inside the title panel, after the subtitle; the panel holds only
         # spans, so its first closing </div> is its own.
         text, n = re.subn(
